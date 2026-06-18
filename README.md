@@ -1,10 +1,15 @@
 # Sentinel
 
 A natural-language Linux server manager. Describe what you want in plain
-English; Sentinel translates it into a single shell command, shows you exactly
-what it will run, and executes it **only after you approve it**. It can also
-explain what a command does, answer Linux questions, and summarize a command's
-output back into plain English, all tuned to your experience level.
+English; Sentinel translates it into the right shell command, shows you exactly
+what it will run, and executes it **only after you approve it**. Then it reads
+the output back to you in plain English.
+
+It is built for real server work, the kind that means hunting for the right
+flags: checking capacity, parsing error logs, watching game-server processes.
+Sentinel is more than a thin LLM wrapper around a terminal: it knows the flags,
+**refuses destructive commands**, and **interprets messy output** so you do not
+have to, all tuned to your experience level.
 
 ![Sentinel CLI demo](assets/cli-demo.gif)
 
@@ -16,10 +21,13 @@ output back into plain English, all tuned to your experience level.
 
 ## Features
 
-**Plain English to one shell command.**
-Type `how much free disk space do I have?` and Sentinel produces `df -h`. The
-model acts strictly as a *translator*: it returns exactly one command, with no
-chatter or markdown, and refuses anything that is not a real Linux operation.
+**Plain English to the right command.**
+Ask *what errors hit the system journal in the last hour?* and Sentinel runs
+`journalctl -p err --since "1 hour ago" --no-pager` - the exact flags you would
+otherwise have to look up. Ask *which processes are using the most memory?* and
+it runs `ps -eo pid,comm,%mem,rss --sort=-%mem | head`. It returns exactly one
+command, with no chatter or markdown, and refuses anything that is not a real
+Linux operation.
 
 **Two layers of safety.**
 A blocklist filter refuses destructive patterns (`rm -rf`, `mkfs`, `dd of=…`,
@@ -45,9 +53,10 @@ catalog on demand.
 On first launch Sentinel asks about your Linux experience (beginner,
 intermediate, or expert) and whether you want explanations. Before running, it
 can show a plain-English description of the command; after running, it reads the
-output and answers your original question (for example, *"You have about 949 GB
-free on `/`."*) and explains failures when a command errors. Re-take the
-questionnaire anytime with `profile`.
+output and answers your original question, turning a wall of `journalctl` errors
+into something like *"Most failures are the Bluetooth service failing to start;
+the rest are harmless timeouts."* It explains non-obvious failures too. Re-take
+the questionnaire anytime with `profile`.
 
 **Ask mode.**
 Use `ask <question>` for a one-shot answer, or `ask` / `chat` for a multi-turn

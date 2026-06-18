@@ -237,7 +237,7 @@
   <section id="view-cmd">
     <div class="card" style="padding:15px">
       <div class="composer">
-        <textarea id="request" rows="2" placeholder="Describe a task in plain English, e.g. how much free disk space do I have?"></textarea>
+        <textarea id="request" rows="2" placeholder="Describe a task in plain English, e.g. what errors hit the journal in the last hour?"></textarea>
         <button class="btn primary" id="translate">Translate</button>
       </div>
       <div class="examples" id="examples"></div>
@@ -356,10 +356,10 @@ const state = {
 };
 
 const EXAMPLES = [
-  "how much free disk space do I have?",
-  "show the 50 most recent system log lines",
+  "what errors hit the system journal in the last hour?",
   "which processes are using the most memory?",
-  "create a folder called backups in my home directory",
+  "what is listening on port 8080?",
+  "find the 20 largest files under /var/log",
 ];
 
 const LEVELS = [
