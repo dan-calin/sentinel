@@ -453,8 +453,13 @@ def save_settings(settings: Settings) -> bool:
 # ---------------------------------------------------------------------------
 
 _DANGEROUS_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\brm\b.*\b-[a-z]*r[a-z]*f|\brm\b.*\b-[a-z]*f[a-z]*r", re.I),
-     "Recursive force-delete (rm -rf) can destroy entire directory trees."),
+    # NOTE: flag tokens are matched with `(?:^|\s)-`, NOT `\b-`. A space-to-hyphen
+    # transition is not a word boundary, so `\b-` would never match a flag and the
+    # rule would silently never fire.
+    (re.compile(r"\brm\b(?=.*(?:(?:^|\s)-\w*r|\s--recursive\b))", re.I),
+     "Recursive delete (rm -r / -rf) can wipe entire directory trees."),
+    (re.compile(r"\brm\b.*(?:^|\s|/)\*", re.I),
+     "Deleting with a wildcard (rm ... *) can erase everything in a directory."),
     (re.compile(r"\bmkfs\b", re.I),
      "mkfs formats a filesystem, irreversibly erasing the target device."),
     (re.compile(r"\bdd\b.*\bof=", re.I),
@@ -467,7 +472,7 @@ _DANGEROUS_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
      "Partition/swap tools can repartition or wipe storage."),
     (re.compile(r":\s*\(\s*\)\s*\{.*\|.*&\s*\}", re.I),
      "Looks like a fork bomb, which can exhaust system resources."),
-    (re.compile(r"\bchmod\b.*\b-[a-z]*R[a-z]*\b.*\b000\b"),
+    (re.compile(r"\bchmod\b.*(?:^|\s)-\w*R\w*\b.*\b000\b"),
      "Recursive chmod 000 can lock you out of files and directories."),
     (re.compile(r">\s*/etc/(passwd|shadow|fstab)\b", re.I),
      "Overwriting critical system files can render the host unbootable."),
