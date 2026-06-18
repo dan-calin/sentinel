@@ -11,7 +11,7 @@ Sentinel is more than a thin LLM wrapper around a terminal: it knows the flags,
 **refuses destructive commands**, and **interprets messy output** so you do not
 have to, all tuned to your experience level.
 
-![Sentinel CLI demo](assets/cli-demo.gif)
+![Sentinel CLI demo](assets/cli-demo.gif?v=2)
 
 > **Safety first.** Sentinel never runs anything on its own. Every command is
 > screened against a destructive-command blocklist **and** gated behind an
