@@ -1,94 +1,88 @@
 # Sentinel
 
-**A natural-language Linux server manager.** Describe what you want in plain
+A natural-language Linux server manager. Describe what you want in plain
 English; Sentinel translates it into a single shell command, shows you exactly
 what it will run, and executes it **only after you approve it**. It can also
 explain what a command does, answer Linux questions, and summarize a command's
-output back into plain English — all tuned to your experience level.
+output back into plain English, all tuned to your experience level.
 
-> Safety first: Sentinel never runs anything on its own. Every command is
+![Sentinel CLI demo](assets/sentinel-demo.svg)
+
+> **Safety first.** Sentinel never runs anything on its own. Every command is
 > screened against a destructive-command blocklist **and** gated behind an
 > explicit `y/n` confirmation before it can touch your machine.
 
 ---
 
-## What it can do
+## Features
 
-### 🧠 Plain English → one shell command
+**Plain English to one shell command.**
 Type `how much free disk space do I have?` and Sentinel produces `df -h`. The
-LLM acts strictly as a *translator*: it returns exactly one command — no chatter,
-no markdown — and refuses anything that isn't a real Linux operation.
+model acts strictly as a *translator*: it returns exactly one command, with no
+chatter or markdown, and refuses anything that is not a real Linux operation.
 
-### 🛡️ Two layers of safety
-1. **Blocklist filter** — destructive patterns (`rm -rf`, `mkfs`, `dd of=…`,
-   fork bombs, overwriting `/etc/passwd`, formatting devices, …) are refused
-   *before* you're ever asked, with a reason.
-2. **Confirmation gate** — everything else is shown in a panel and waits for an
-   explicit `y`. A bare Enter (or anything but `y`) means "no."
+**Two layers of safety.**
+A blocklist filter refuses destructive patterns (`rm -rf`, `mkfs`, `dd of=…`,
+fork bombs, formatting devices, overwriting `/etc/passwd`, and the like)
+*before* you are ever asked, with a reason. Everything else is shown for review
+and waits for an explicit `y`; anything else means no.
 
-### 🤖 Bring your own AI — many providers, current models
-Switch providers and models at any time. Built-in support for:
+**Bring your own AI.**
+Switch providers and models at any time. Each provider ships a curated, dated
+model list that appears instantly, plus a `refresh` action that pulls the live
+catalog on demand.
 
 | Provider | How it connects | Example models |
 |---|---|---|
-| **Anthropic (Claude)** | native SDK | `claude-sonnet-4-6`, `claude-opus-4-8`, `claude-haiku-4-5` |
-| **OpenAI (GPT)** | OpenAI API | `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.4-nano` |
-| **Google (Gemini)** | OpenAI-compatible endpoint | `gemini-3.5-flash`, `gemini-2.5-pro` |
-| **OpenRouter** | gateway | `anthropic/claude-sonnet-4-6`, `deepseek/deepseek-v4-flash`, … |
-| **Ollama (local)** | no API key | whatever you've pulled (`llama3.3`, `qwen3`, …) |
-| **Custom** | any OpenAI-compatible URL + key | your endpoint |
+| Anthropic (Claude) | native SDK | `claude-sonnet-4-6`, `claude-opus-4-8`, `claude-haiku-4-5` |
+| OpenAI (GPT) | OpenAI API | `gpt-5.5`, `gpt-5.4-mini`, `gpt-5.4-nano` |
+| Google (Gemini) | OpenAI-compatible endpoint | `gemini-3.5-flash`, `gemini-2.5-pro` |
+| OpenRouter | gateway | `anthropic/claude-sonnet-4-6`, `deepseek/deepseek-v4-flash`, … |
+| Ollama (local) | no API key | whatever you have pulled (`llama3.3`, `qwen3`, …) |
+| Custom | any OpenAI-compatible URL + key | your endpoint |
 
-Each provider ships a **curated, dated model list** that appears instantly, and
-the model picker has a **`refresh`** action that pulls the provider's live
-catalog on demand.
+**Explanations tuned to you.**
+On first launch Sentinel asks about your Linux experience (beginner,
+intermediate, or expert) and whether you want explanations. Before running, it
+can show a plain-English description of the command; after running, it reads the
+output and answers your original question (for example, *"You have about 949 GB
+free on `/`."*) and explains failures when a command errors. Re-take the
+questionnaire anytime with `profile`.
 
-### 🎓 Explanations tuned to *you*
-On first launch Sentinel asks about your Linux experience (beginner /
-intermediate / expert) and whether you want explanations. Based on that:
-- **Before** running, it shows a plain-English *"What this does"* (jargon-free
-  for beginners, terse for experts — or off entirely).
-- **After** running, it reads the output and answers your original question in
-  plain English — *"You have ~949 GB free on `/`."* — and explains failures when
-  a command errors.
-
-Re-take the questionnaire anytime with the `profile` command.
-
-### 💬 Ask mode (Q&A / chat)
+**Ask mode.**
 Use `ask <question>` for a one-shot answer, or `ask` / `chat` for a multi-turn
 conversation about Linux, the shell, and system administration. This is
-**information only** — nothing is executed here — and answers adapt to your
-experience level.
+information only; nothing is executed, and answers adapt to your experience level.
 
-### ✨ Polished terminal UI
-A welcome box (owl mark + live status), syntax-highlighted commands, clear
-stdout/stderr panels, and a dark-blue theme. Press **Esc** to cancel any
-in-progress task - a slow translation, a long-running command (its whole
-process tree is stopped), or a chat reply.
+**Built for the terminal.**
+A clean welcome box with live status, syntax-highlighted commands, and clear
+output panels. Press **Esc** to cancel any in-progress task: a slow translation,
+a long-running command (its whole process tree is stopped), or a chat reply.
 
 ---
 
-## The interaction loop
+## How it works
 
 ```
-type English ─▶ LLM translates ─▶ safety filter screens
-                                        │
-                              ┌─────────┴─────────┐
-                           blocked            allowed
-                              │                   │
-                         show reason      "What this does" (optional)
-                                                  │
-                                          you approve? ── n ─▶ skip
-                                                  │ y
-                                              execute
-                                                  │
-                                          "In short" summary (optional)
+type English  ->  model translates  ->  safety filter screens
+                                              |
+                                    +---------+---------+
+                                 blocked            allowed
+                                    |                   |
+                               show reason     "what this does" (optional)
+                                                        |
+                                                you approve?  -- n -->  skip
+                                                        | y
+                                                    execute
+                                                        |
+                                              plain-English summary (optional)
 ```
 
 ---
 
 ## Getting started
 
-Requires **Python 3.10+**.
+Requires Python 3.10+.
 
 ```bash
 cd ~/Linux_LLM
@@ -102,25 +96,25 @@ cp .env.example .env   # then edit .env
 python main.py
 ```
 
-> On a fresh Ubuntu/WSL box you may need `sudo apt install -y python3-venv`
-> first. Use the virtual environment rather than installing globally.
+On a fresh Ubuntu/WSL box you may first need `sudo apt install -y python3-venv`.
+Use the virtual environment rather than installing globally.
 
 First run walks you through a short questionnaire, then a provider/model picker.
-**After that, Sentinel remembers your provider, model, and API key** — launches
-go straight to the prompt with no menus and no re-entering keys.
+After that, Sentinel remembers your provider, model, and API key, so launches go
+straight to the prompt with no menus and no re-entering keys.
+
+---
 
 ## Architecture
 
 ```
-   core.py     ← all logic, no UI (engines, safety, profile, settings, exec)
-      │
-   main.py     ← the terminal UI (rich)
-
-   gui/        ← experimental web UI over the same core (paused; see gui/README.md)
+core.py    all logic, no UI (engines, safety filter, profile, settings, execution)
+main.py    the terminal UI (built on rich)
+gui/       experimental web UI over the same core (paused; see gui/README.md)
 ```
 
 `core.py` is the single source of truth. A web GUI lives under `gui/` but is a
-**paused work-in-progress** while its design is reworked - it is not part of the
+paused work in progress while its design is reworked; it is not part of the
 shipped CLI.
 
 ---
@@ -129,9 +123,9 @@ shipped CLI.
 
 A leading slash is optional (`/ask` works too).
 
-| Command | Does |
+| Command | Description |
 |---|---|
-| *(plain English)* | Translate → review → approve → run a command |
+| *(plain English)* | Translate, review, approve, and run a command |
 | `ask <q>` / `ask` / `chat` | Ask Linux questions (answers only; nothing runs) |
 | `provider` | Switch AI provider |
 | `model` | Pick a model (curated list, or `r` to refresh the live catalog) |
@@ -147,31 +141,31 @@ A leading slash is optional (`/ask` works too).
   saved to `~/.config/sentinel/config.json` (written `chmod 600`, outside the
   repo, never committed), so you set them once. Change them anytime with the
   `provider` / `model` commands.
-- **API keys** can also come from `.env` (git-ignored); env values take
-  precedence over the saved ones. A key you set via `.env` is never prompted.
+- **API keys** can also come from `.env` (git-ignored); environment values take
+  precedence over the saved ones. A key set via `.env` is never prompted for.
 - **Override per launch** with `SENTINEL_PROVIDER` and `SENTINEL_MODEL`.
-- **Your profile** (experience level + explanation preference) is saved to
+- **Your profile** (experience level and explanation preference) is saved to
   `~/.config/sentinel/profile.json`.
 
 ---
 
 ## Roadmap
 
-- [x] **Shared core** (`core.py`) so the CLI (and a future GUI) run one engine.
-- [x] **Esc to cancel** any in-progress task (LLM call or running command).
-- [x] **Remembered provider / model / key** across launches.
-- [ ] **Web GUI** — paused under `gui/` while the design is reworked.
+- [x] Shared core (`core.py`) so the CLI (and a future GUI) run one engine.
+- [x] Esc to cancel any in-progress task (LLM call or running command).
+- [x] Remembered provider, model, and key across launches.
+- [ ] Web GUI (paused under `gui/` while the design is reworked).
 - [ ] Remote execution (SSH) and an allow-list mode beyond V1's local execution.
 
 ---
 
 ## Safety notes
 
-- V1 runs commands on the **local** machine via the shell. The blocklist is a
-  conservative backstop, **not** a sandbox — the confirmation gate is your real
+- V1 runs commands on the local machine via the shell. The blocklist is a
+  conservative backstop, not a sandbox; the confirmation gate is your real
   control. Read each command before approving.
-- Smaller/local models follow the "one command only" and scope rules less
-  reliably than frontier models; for the sharpest behavior use Claude, GPT, or
+- Smaller and local models follow the "one command only" and scope rules less
+  reliably than frontier models. For the sharpest behavior, use Claude, GPT, or
   Gemini.
 
 ---
@@ -180,7 +174,7 @@ A leading slash is optional (`/ask` works too).
 
 Sentinel is released under the **PolyForm Noncommercial License 1.0.0** (see
 [`LICENSE`](LICENSE)). In short: you may use, modify, and share it freely for
-**noncommercial** purposes, but you may **not sell it or use it for commercial
-advantage**. Note this is a *source-available, noncommercial* license, not an
-OSI-approved "open source" license (true open-source licenses cannot restrict
+noncommercial purposes, but you may not sell it or use it for commercial
+advantage. This is a source-available, noncommercial license, not an
+OSI-approved open-source license (a true open-source license cannot restrict
 commercial use). For commercial licensing, contact the author.
