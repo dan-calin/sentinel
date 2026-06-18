@@ -1,0 +1,13 @@
+# Sentinel — runtime dependencies
+#
+# Pin to compatible-release ranges (~=) so `pip install -r requirements.txt`
+# stays reproducible while still picking up patch/security updates.
+
+anthropic~=0.69      # Native SDK for the Anthropic (Claude) provider
+openai~=1.99         # Used for every OpenAI-compatible provider:
+                     #   OpenAI, Google Gemini, OpenRouter, Ollama, Custom
+rich~=14.0           # Terminal UI (CLI): panels, tables, syntax highlighting
+python-dotenv~=1.0   # Loads provider API keys from a local .env file
+
+# The web GUI is a separate, paused work-in-progress; its extra dependencies
+# live in gui/requirements.txt and are not needed for the CLI.

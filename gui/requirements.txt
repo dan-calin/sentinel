@@ -1,0 +1,4 @@
+# Sentinel GUI (paused WIP) — extra dependencies for the web backend.
+# Install the CLI deps first: pip install -r requirements.txt
+fastapi~=0.136       # Local HTTP API over the shared core engine
+uvicorn~=0.34        # ASGI server to run FastAPI
