@@ -6,7 +6,7 @@ what it will run, and executes it **only after you approve it**. It can also
 explain what a command does, answer Linux questions, and summarize a command's
 output back into plain English, all tuned to your experience level.
 
-![Sentinel CLI demo](assets/sentinel-demo.gif)
+![Sentinel CLI demo](assets/cli-demo.gif)
 
 > **Safety first.** Sentinel never runs anything on its own. Every command is
 > screened against a destructive-command blocklist **and** gated behind an
