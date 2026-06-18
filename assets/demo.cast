@@ -90,5 +90,3 @@
 [13.25905, "o", "\r\u001b[2K\u001b[32m⠸\u001b[0m \u001b[36mSummarizing result…\u001b[0m  \u001b[2m(Esc to cancel)\u001b[0m"]
 [13.259645, "o", "\u001b[32m╭─\u001b[0m\u001b[32m \u001b[0m\u001b[1;32mIn short\u001b[0m\u001b[32m \u001b[0m\u001b[32m──────────────────────────────────────────────────────────────────────────────────────────────────────────\u001b[0m\u001b[32m─╮\u001b[0m\r\n\u001b[32m│\u001b[0m You have **949G available** on the filesystem mounted at `/` (`/dev/sdd`). It’s a **1007G** filesystem with **6.9G   \u001b[32m│\u001b[0m\r\n\u001b[32m│\u001b[0m used**, so about **1%** full.                                                                                        \u001b[32m│\u001b[0m\r\n\u001b[32m╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯\u001b[0m\r\n"]
 [13.259954, "o", "\r\n\u001b[1;36m>\u001b[0m \u001b[2m(openrouter:nex-agi/nex-n2-pro:free)\u001b[0m: "]
-[16.669391, "o", "^C"]
-[16.67001, "o", "\r\n\u001b[2mGoodbye.\u001b[0m\r\n"]
