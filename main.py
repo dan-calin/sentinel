@@ -308,6 +308,89 @@ def _vision_hint(images, error: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Vision bridge
+#
+# When the active model is text-only but an image is attached, we route the
+# image to a vision-capable model on the SAME provider (Gemini by default on
+# OpenRouter), get a transcription + description, and feed that text to the
+# primary model. This mirrors a multimodal "fallback" pipeline: the primary
+# model never sees the image, it reads the vision model's words.
+# ---------------------------------------------------------------------------
+
+# Error fragments that mean "this model/endpoint won't accept the image".
+_IMAGE_ERROR_MARKERS = (
+    "image input", "no endpoints", "support image", "image_url",
+    "multimodal", "does not support image", "cannot process image",
+)
+
+
+def _is_image_error(error: str) -> bool:
+    """Whether a provider error looks like an image-not-supported failure."""
+    low = error.lower()
+    return any(marker in low for marker in _IMAGE_ERROR_MARKERS)
+
+
+# Stored in settings.vision_model to turn the bridge off entirely.
+_VISION_OFF = "off"
+
+
+def _bridge_model(provider_key: str) -> str | None:
+    """The vision-bridge model for a provider (env / saved override, else default).
+
+    Returns ``None`` when the user has disabled the bridge, or no model applies.
+    """
+    override = os.getenv("SENTINEL_VISION_MODEL") or _settings.vision_model
+    if override:
+        return None if override.lower() == _VISION_OFF else override
+    return core.DEFAULT_VISION_MODELS.get(provider_key)
+
+
+def _build_bridge_engine(engine: core.Engine, model: str) -> core.Engine:
+    """Build a sibling engine on the same provider/credentials, different model."""
+    creds = _creds_for(engine.spec)
+    return core.create_engine(engine.spec, model, creds.api_key, creds.base_url)
+
+
+def _augment_with_description(text: str, description: str) -> str:
+    """Fold a vision model's transcription into a text-only request."""
+    stripped = _PLACEHOLDER_RE.sub("", text).strip()
+    base = stripped or "(respond based on the attached image)"
+    return (
+        f"{base}\n\n[Transcription and description of the attached image(s), "
+        f"provided by a vision model]:\n{description}"
+    )
+
+
+def _bridge_request(engine: core.Engine, text: str, images, error: str) -> str | None:
+    """Describe images via a vision bridge and return augmented (text-only) input.
+
+    Returns ``None`` when bridging doesn't apply (not an image error, no bridge
+    model, bridge == primary) or fails/cancels, so the caller falls back to its
+    normal error handling.
+    """
+    if not (images and _is_image_error(error)):
+        return None
+    bridge_model = _bridge_model(engine.spec.key)
+    if not bridge_model or bridge_model == engine.model:
+        return None
+    try:
+        bridge = _build_bridge_engine(engine, bridge_model)
+        description, cancelled = run_with_cancel(
+            lambda: bridge.describe_images(text, images),
+            f"[cyan]{engine.model} can't see images — reading them with {bridge_model}…[/]",
+        )
+    except core.TranslationError:
+        return None
+    if cancelled or not description:
+        return None
+    console.print(
+        f"[dim]Read the image(s) with {bridge_model}, then handed the text to "
+        f"{engine.model}.[/]"
+    )
+    return _augment_with_description(text, description)
+
+
+# ---------------------------------------------------------------------------
 # Paste-aware line editor
 #
 # A small raw-mode line reader (used in place of rich's Prompt on an
@@ -557,6 +640,25 @@ def _remember(engine: core.Engine) -> None:
     core.save_settings(_settings)
 
 
+def _creds_for(spec: core.ProviderSpec) -> core.Credentials:
+    """Resolve a provider's credentials from env + saved settings (no prompting).
+
+    Used to build sibling engines (e.g. the vision bridge) without re-asking for
+    anything; the primary engine's key already came from the same sources.
+    """
+    base = spec.base_url
+    if spec.runtime_config:
+        base = os.getenv("CUSTOM_BASE_URL") or _settings.base_urls.get(spec.key) or base
+    elif spec.key == "ollama":
+        base = os.getenv("OLLAMA_HOST") or _settings.base_urls.get(spec.key) or base
+    key = ""
+    if spec.api_key_env:
+        key = os.getenv(spec.api_key_env) or _settings.api_keys.get(spec.key, "")
+    elif spec.runtime_config:
+        key = os.getenv("CUSTOM_API_KEY") or _settings.api_keys.get(spec.key, "")
+    return core.Credentials(api_key=key, base_url=base)
+
+
 def resolve_credentials(spec: core.ProviderSpec) -> core.Credentials:
     """Gather the API key and base URL for a provider.
 
@@ -678,6 +780,45 @@ def select_model(engine: core.Engine) -> None:
         return
 
 
+def select_vision_model(engine: core.Engine) -> None:
+    """Set the vision 'fallback' model used when the main model can't see images."""
+    provider_default = core.DEFAULT_VISION_MODELS.get(engine.spec.key)
+    effective = _bridge_model(engine.spec.key)
+    console.print(
+        Panel(
+            Text.from_markup(
+                "[bold]Vision fallback[/] — when your main model can't read an "
+                "attached image, Sentinel routes it to this model (on the same "
+                "provider) to transcribe and describe it, then hands that text to "
+                "your main model.\n"
+                f"[dim]Active model: [/][cyan]{engine.model}[/][dim]; provider "
+                f"default fallback: [/][cyan]{provider_default or '(none)'}[/][dim].[/]"
+            ),
+            title="Vision fallback model",
+            border_style=ACCENT,
+            title_align="left",
+        )
+    )
+    console.print(
+        f"[dim]Currently using: [/][cyan]{effective or '(disabled)'}[/]\n"
+        "[dim]Enter a model ID to use as the fallback, [/][cyan]default[/][dim] "
+        "for the provider default, [/][cyan]off[/][dim] to disable, or Enter to keep.[/]"
+    )
+    answer = Prompt.ask("Vision fallback model", default="").strip()
+    if not answer:
+        return
+    if answer.lower() == "default":
+        _settings.vision_model = None
+        console.print(f"[green]Using the provider default[/] ([cyan]{provider_default or 'none'}[/]).")
+    elif answer.lower() in {"off", "none", "disable"}:
+        _settings.vision_model = _VISION_OFF
+        console.print("[green]Vision fallback disabled.[/]")
+    else:
+        _settings.vision_model = answer
+        console.print(f"[green]Vision fallback set to[/] [bold]{answer}[/].")
+    core.save_settings(_settings)
+
+
 # ---------------------------------------------------------------------------
 # Onboarding
 # ---------------------------------------------------------------------------
@@ -761,8 +902,18 @@ def ask_once(
             "[cyan]Thinking…[/]",
         )
     except core.TranslationError as exc:
-        console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images, str(exc))}")
-        return
+        augmented = _bridge_request(engine, question, images, str(exc))
+        if augmented is None:
+            console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images, str(exc))}")
+            return
+        try:
+            answer, cancelled = run_with_cancel(
+                lambda: engine.ask([core.user_message(augmented, [])], profile),
+                "[cyan]Thinking…[/]",
+            )
+        except core.TranslationError as exc2:
+            console.print(f"[bold red]Couldn't answer:[/] {exc2}")
+            return
     if cancelled:
         console.print("[dim]Cancelled.[/]")
         return
@@ -807,9 +958,20 @@ def run_chat(engine: core.Engine, profile: core.UserProfile) -> None:
                 lambda: engine.ask(history, profile), "[cyan]Thinking…[/]"
             )
         except core.TranslationError as exc:
-            console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images, str(exc))}")
-            history.pop()
-            continue
+            augmented = _bridge_request(engine, question, images, str(exc))
+            if augmented is None:
+                console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images, str(exc))}")
+                history.pop()
+                continue
+            history[-1] = core.user_message(augmented, [])  # swap image turn for text
+            try:
+                answer, cancelled = run_with_cancel(
+                    lambda: engine.ask(history, profile), "[cyan]Thinking…[/]"
+                )
+            except core.TranslationError as exc2:
+                console.print(f"[bold red]Couldn't answer:[/] {exc2}")
+                history.pop()
+                continue
         if cancelled:
             history.pop()
             console.print("[dim]Cancelled.[/]")
@@ -855,6 +1017,7 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row(Text.from_markup("[cyan]ask[/]       ask a Linux question"))
     right.add_row(Text.from_markup("[cyan]provider[/]  switch AI provider"))
     right.add_row(Text.from_markup("[cyan]model[/]     pick / refresh model"))
+    right.add_row(Text.from_markup("[cyan]vision[/]    image fallback model"))
     right.add_row(Text.from_markup("[cyan]profile[/]   tune explanation level"))
     right.add_row(Text.from_markup("[cyan]help[/] · [cyan]exit[/]"))
     right.add_row("")
@@ -887,6 +1050,8 @@ def _print_help() -> None:
                 "[cyan]provider[/]  Switch AI provider (Anthropic, OpenAI, Gemini, "
                 "OpenRouter, Ollama, Custom)\n"
                 "[cyan]model[/]     Pick a model (curated list, or 'r' to refresh live)\n"
+                "[cyan]vision[/]    Set the fallback model that reads images when "
+                "your main model can't\n"
                 "[cyan]profile[/]   Re-take the experience questionnaire (sets how "
                 "commands are explained)\n"
                 "[cyan]help[/]      Show this help\n"
@@ -1021,19 +1186,37 @@ def main() -> None:
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Profile unchanged.[/]")
             continue
+        if command_word == "vision":
+            try:
+                select_vision_model(engine)
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Vision fallback unchanged.[/]")
+            continue
 
         # --- Attached images were already parsed by the line editor ----------
         if images and _only_placeholders(request):
             request = "Use the attached image(s) to determine the right command."
 
-        # --- Translate --------------------------------------------------------
+        # --- Translate (with a vision bridge fallback for text-only models) ---
         try:
             command, cancelled = run_with_cancel(
                 lambda: engine.translate(request, images), "[cyan]Translating…[/]"
             )
         except core.TranslationError as exc:
-            console.print(f"[bold red]Translation failed:[/] {exc}{_vision_hint(images, str(exc))}")
-            continue
+            augmented = _bridge_request(engine, request, images, str(exc))
+            if augmented is None:
+                console.print(
+                    f"[bold red]Translation failed:[/] {exc}{_vision_hint(images, str(exc))}"
+                )
+                continue
+            try:
+                request = augmented
+                command, cancelled = run_with_cancel(
+                    lambda: engine.translate(augmented), "[cyan]Translating…[/]"
+                )
+            except core.TranslationError as exc2:
+                console.print(f"[bold red]Translation failed:[/] {exc2}")
+                continue
         if cancelled:
             console.print("[dim]Cancelled.[/]")
             continue

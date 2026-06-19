@@ -77,6 +77,29 @@ MAX_TOKENS = 300            # one shell command
 EXPLAIN_MAX_TOKENS = 220    # short "what this does" note
 ASK_MAX_TOKENS = 800        # prose Q&A answer
 SUMMARY_MAX_TOKENS = 320    # plain-English answer derived from output
+DESCRIBE_MAX_TOKENS = 700   # image transcription + description (vision bridge)
+
+# Vision bridge: when the active model can't see images, route them to one of
+# these (same provider, vision-capable model) to transcribe + describe, then
+# feed that text to the primary model. None => no default for that provider.
+DEFAULT_VISION_MODELS: dict[str, str] = {
+    "openrouter": "nvidia/nemotron-nano-12b-v2-vl:free",
+    "anthropic": "claude-haiku-4-5",
+    "openai": "gpt-5.4-mini",
+    "gemini": "gemini-3.5-flash",
+}
+
+# System prompt for the bridge model: it acts as "eyes" for a text-only model.
+VISION_DESCRIBE_SYSTEM = (
+    "You are the eyes for another AI that cannot see images. Render the attached "
+    "image(s) as faithful plain text so that other model can work from it:\n"
+    "- Transcribe ALL visible text verbatim — commands, code, file paths, error "
+    "messages, numbers, table values — exactly as shown. This is OCR; be precise.\n"
+    "- Then briefly describe what the image is (a terminal, a UI, a chart, a "
+    "diagram) and any layout or visual detail that matters.\n"
+    "Do not answer the underlying request or take any action; only transcribe and "
+    "describe. If several images are attached, label each Image #1, Image #2, …"
+)
 
 # Max characters of stdout/stderr sent to the model for summarization.
 SUMMARY_OUTPUT_CHAR_LIMIT = 4000
@@ -521,6 +544,8 @@ class Settings:
     model: str | None = None
     api_keys: dict[str, str] = field(default_factory=dict)
     base_urls: dict[str, str] = field(default_factory=dict)
+    # Optional override for the vision-bridge model (else a per-provider default).
+    vision_model: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -528,6 +553,7 @@ class Settings:
             "model": self.model,
             "api_keys": self.api_keys,
             "base_urls": self.base_urls,
+            "vision_model": self.vision_model,
         }
 
     @classmethod
@@ -537,6 +563,7 @@ class Settings:
             model=data.get("model") or None,
             api_keys=dict(data.get("api_keys") or {}),
             base_urls=dict(data.get("base_urls") or {}),
+            vision_model=data.get("vision_model") or None,
         )
 
 
@@ -864,6 +891,22 @@ class Engine(abc.ABC):
                 "output rule above."
             )
         return _sanitize_command(self._chat(system, messages, MAX_TOKENS))
+
+    def describe_images(
+        self, request: str, images: "list[ImageAttachment]"
+    ) -> str:
+        """Transcribe + describe attached images (the vision-bridge role).
+
+        Used when the primary model is text-only: a vision-capable engine turns
+        the image(s) into plain text that the primary model can then read.
+        """
+        prompt = request.strip() or "Describe the attached image(s)."
+        user = (
+            f'A text-only model received this request: "{prompt}". '
+            "Transcribe and describe the attached image(s) so it can respond."
+        )
+        messages = [user_message(user, images)]
+        return self._chat(VISION_DESCRIBE_SYSTEM, messages, DESCRIBE_MAX_TOKENS).strip()
 
     def explain(self, command: str, profile: UserProfile) -> str:
         """Explain a proposed command at the user's experience level."""

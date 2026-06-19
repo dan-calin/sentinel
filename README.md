@@ -69,8 +69,15 @@ image path in your prompt — Sentinel sends it to the model as context. A
 pasted file path is replaced inline with a tidy `[Image #1]` token instead of a
 long path, so *"why is this failing? ~/screenshot.png"* reads cleanly. Useful
 for a screenshot of an error, a dashboard, or output from another tool. Works in
-both translate and `ask`/`chat` modes, with any vision-capable model (Claude,
-GPT, Gemini, and most others); a model that can't read images simply says so.
+both translate and `ask`/`chat` modes.
+
+**Vision fallback for text-only models.**
+If your main model can't read images (many fast or free models are text-only),
+Sentinel automatically routes the image to a vision model on the *same* provider
+to transcribe and describe it, then feeds that text to your main model — so a
+text-only model effectively gains eyes. The default fallback on OpenRouter is a
+free vision model (`nvidia/nemotron-nano-12b-v2-vl:free`); change or disable it
+anytime with the `vision` command.
 
 **Built for the terminal.**
 A clean welcome box with live status, syntax-highlighted commands, and clear
@@ -172,6 +179,7 @@ A leading slash is optional (`/ask` works too).
 | `ask <q>` / `ask` / `chat` | Ask Linux questions (answers only; nothing runs) |
 | `provider` | Switch AI provider |
 | `model` | Pick a model (curated list, or `r` to refresh the live catalog) |
+| `vision` | Set/disable the fallback model that reads images for text-only models |
 | `profile` | Re-take the experience questionnaire |
 | `help` | Show the command reference |
 | `exit` | Quit (Ctrl-D also works) |
