@@ -288,10 +288,19 @@ def _report_image_notes(notes) -> None:
             console.print(f"[yellow]Skipped image[/] [dim]({message})[/]")
 
 
-def _vision_hint(images) -> str:
+def _vision_hint(images, error: str = "") -> str:
     """Markup hint to append on failure when images were attached."""
     if not images:
         return ""
+    low = error.lower()
+    if "image input" in low or "no endpoints" in low or "support image" in low:
+        # The model may well be vision-capable elsewhere; the gateway just isn't
+        # routing this request to an image-capable endpoint.
+        return (
+            "\n[dim]The provider returned no image-capable endpoint for this "
+            "model. Choose a vision model with [/][cyan]model[/][dim], or connect "
+            "the vision endpoint directly via [/][cyan]provider[/][dim] → Custom.[/]"
+        )
     return (
         "\n[dim]If the selected model can't read images, switch to a "
         "vision-capable one (Claude, GPT, Gemini) or omit the image.[/]"
@@ -752,7 +761,7 @@ def ask_once(
             "[cyan]Thinking…[/]",
         )
     except core.TranslationError as exc:
-        console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images)}")
+        console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images, str(exc))}")
         return
     if cancelled:
         console.print("[dim]Cancelled.[/]")
@@ -798,7 +807,7 @@ def run_chat(engine: core.Engine, profile: core.UserProfile) -> None:
                 lambda: engine.ask(history, profile), "[cyan]Thinking…[/]"
             )
         except core.TranslationError as exc:
-            console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images)}")
+            console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images, str(exc))}")
             history.pop()
             continue
         if cancelled:
@@ -1023,7 +1032,7 @@ def main() -> None:
                 lambda: engine.translate(request, images), "[cyan]Translating…[/]"
             )
         except core.TranslationError as exc:
-            console.print(f"[bold red]Translation failed:[/] {exc}{_vision_hint(images)}")
+            console.print(f"[bold red]Translation failed:[/] {exc}{_vision_hint(images, str(exc))}")
             continue
         if cancelled:
             console.print("[dim]Cancelled.[/]")
