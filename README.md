@@ -64,12 +64,13 @@ conversation about Linux, the shell, and system administration. This is
 information only; nothing is executed, and answers adapt to your experience level.
 
 **Attach an image for context.**
-Include an image path in your prompt — or just drag the file into the terminal —
-and Sentinel sends it to the model as context: *"why is this failing?
-~/screenshot.png"*. Useful for a screenshot of an error, a dashboard, or output
-from another tool. Works in both translate and `ask`/`chat` modes, with any
-vision-capable model (Claude, GPT, Gemini, and most others); a model that can't
-read images simply says so.
+Paste a screenshot, press **Ctrl-V** to grab the clipboard image, or include an
+image path in your prompt — Sentinel sends it to the model as context. A
+pasted file path is replaced inline with a tidy `[Image #1]` token instead of a
+long path, so *"why is this failing? ~/screenshot.png"* reads cleanly. Useful
+for a screenshot of an error, a dashboard, or output from another tool. Works in
+both translate and `ask`/`chat` modes, with any vision-capable model (Claude,
+GPT, Gemini, and most others); a model that can't read images simply says so.
 
 **Built for the terminal.**
 A clean welcome box with live status, syntax-highlighted commands, and clear

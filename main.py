@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 import re
 import select
+import shutil
+import subprocess
 import sys
 import threading
 from contextlib import contextmanager
@@ -230,7 +232,7 @@ _IMG_PATH_RE = re.compile(
 )
 
 
-def extract_images(text: str):
+def extract_images(text: str, start_index: int = 0):
     """Split a prompt into (clean_text, images, notes).
 
     ``images`` are successfully loaded :class:`core.ImageAttachment` objects.
@@ -240,6 +242,10 @@ def extract_images(text: str):
     looks like an image path but can't be loaded is left in the text and
     reported via ``notes`` (``("ok"|"err", message)``), so a stray ".png" word
     is never silently swallowed.
+
+    ``start_index`` is how many images were already attached (e.g. live in the
+    paste-aware editor), so placeholder numbering continues from there instead
+    of restarting at #1.
     """
     matches = list(_IMG_PATH_RE.finditer(text))
     if not matches:
@@ -250,7 +256,7 @@ def extract_images(text: str):
         path = (match.group(1) or match.group(2) or match.group(3)).replace("\\ ", " ")
         try:
             images.append(core.load_image(path))
-            label = f"Image #{len(images)}"
+            label = f"Image #{start_index + len(images)}"
             notes.append(("ok", label))
             replacements.append((match.span(), f"[{label}]"))
         except core.ImageError as exc:
@@ -290,6 +296,239 @@ def _vision_hint(images) -> str:
         "\n[dim]If the selected model can't read images, switch to a "
         "vision-capable one (Claude, GPT, Gemini) or omit the image.[/]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Paste-aware line editor
+#
+# A small raw-mode line reader (used in place of rich's Prompt on an
+# interactive TTY) that turns on the terminal's *bracketed paste* mode. When
+# you paste a screenshot — Windows Terminal pastes the file path; we also grab a
+# real clipboard image on Ctrl-V — it inserts a clean [Image #N] token in the
+# line instead of a long path, and stashes the image to send as context. This is
+# how a tool like Claude Code shows [Image #N] inline as you type.
+#
+# Anywhere this can't run (no TTY, native Windows without termios) it falls back
+# to rich's Prompt, and image paths are still recognized after you press Enter.
+# ---------------------------------------------------------------------------
+
+# A console forced into terminal mode so we can render the prompt's markup to
+# ANSI and redraw it ourselves on each keystroke.
+_ansi_console = Console(force_terminal=True, color_system="truecolor")
+
+
+def _render_markup(markup: str) -> str:
+    """Render rich markup to a raw ANSI string for manual redrawing."""
+    with _ansi_console.capture() as cap:
+        _ansi_console.print(markup, end="")
+    return cap.get()
+
+
+def _byte_ready(timeout: float) -> bool:
+    """Whether stdin has a byte available within ``timeout`` seconds."""
+    return bool(select.select([sys.stdin], [], [], timeout)[0])
+
+
+def _read_paste_body() -> str:
+    """Read a bracketed-paste payload up to the ``ESC[201~`` terminator."""
+    data = ""
+    while not data.endswith("\x1b[201~"):
+        ch = sys.stdin.read(1)
+        if ch == "":
+            break
+        data += ch
+    if data.endswith("\x1b[201~"):
+        data = data[:-6]
+    # A pasted path/command is one logical line; fold newlines to spaces.
+    return data.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _read_key():
+    """Read one logical key press, returning a small ``(kind, …)`` token."""
+    ch = sys.stdin.read(1)
+    if ch == "":
+        return ("eof",)
+    if ch == "\x03":
+        return ("interrupt",)
+    if ch == "\x04":
+        return ("eof",)
+    if ch == "\x16":  # Ctrl-V → attach clipboard image
+        return ("paste-image",)
+    if ch in ("\r", "\n"):
+        return ("enter",)
+    if ch in ("\x7f", "\x08"):
+        return ("backspace",)
+    if ch == "\x01":  # Ctrl-A
+        return ("home",)
+    if ch == "\x05":  # Ctrl-E
+        return ("end",)
+    if ch == "\x1b":
+        if not _byte_ready(0.05):
+            return ("ignore",)  # bare Esc
+        if sys.stdin.read(1) != "[":
+            return ("ignore",)
+        seq = ""
+        while _byte_ready(0.05):
+            c = sys.stdin.read(1)
+            seq += c
+            if c.isalpha() or c == "~":
+                break
+        return {
+            "C": ("right",), "D": ("left",), "H": ("home",), "F": ("end",),
+            "3~": ("delete",), "200~": ("paste", _read_paste_body()),
+        }.get(seq, ("ignore",))
+    if ch < " ":
+        return ("ignore",)  # other control characters
+    return ("char", ch)
+
+
+def _grab_clipboard_image() -> "core.ImageAttachment | None":
+    """Save a clipboard image to a temp PNG via PowerShell (WSL) and load it."""
+    powershell = shutil.which("powershell.exe")
+    if not powershell:
+        return None
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+        "$i=[Windows.Forms.Clipboard]::GetImage();"
+        "if($i){$p=[IO.Path]::ChangeExtension([IO.Path]::GetTempFileName(),'png');"
+        "$i.Save($p,[Drawing.Imaging.ImageFormat]::Png);[Console]::Out.Write($p)}"
+    )
+    try:
+        done = subprocess.run(
+            [powershell, "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    path = done.stdout.strip()
+    if not path:
+        return None
+    try:
+        return core.load_image(path)
+    except core.ImageError:
+        return None
+
+
+def _insert_paste(pasted: str, images: list) -> str:
+    """Turn a pasted string into text to insert, attaching any image paths.
+
+    Recognized, loadable image paths become ``[Image #N]`` (numbering continues
+    from ``images``); everything else is inserted literally.
+    """
+    out, last = [], 0
+    for match in _IMG_PATH_RE.finditer(pasted):
+        path = (match.group(1) or match.group(2) or match.group(3)).replace("\\ ", " ")
+        try:
+            attachment = core.load_image(path)
+        except core.ImageError:
+            continue  # not a real image — leave it as literal text
+        out.append(pasted[last:match.start()])
+        images.append(attachment)
+        out.append(f"[Image #{len(images)}]")
+        last = match.end()
+    out.append(pasted[last:])
+    return "".join(out)
+
+
+def read_prompt(prompt: str):
+    """Read a line, returning ``(text, images)``.
+
+    On an interactive TTY this is a paste-aware editor with live ``[Image #N]``
+    placeholders. Otherwise it falls back to rich's Prompt and returns no images
+    (the caller still scans the text for typed paths afterward).
+
+    Raises:
+        EOFError / KeyboardInterrupt: like ``input()``.
+    """
+    if not (_TERMIOS_OK and sys.stdin.isatty()):
+        return Prompt.ask(prompt), []
+
+    # Print any leading blank lines once; they must not be part of the redraw.
+    lead, body = "", prompt
+    while body.startswith("\n"):
+        lead += "\n"
+        body = body[1:]
+    sys.stdout.write(lead)
+    prompt_ansi = _render_markup(body) + " "
+
+    buf: list[str] = []
+    pos = 0
+    images: list = []
+
+    def redraw() -> None:
+        out = "\r" + prompt_ansi + "".join(buf) + "\x1b[K"
+        if (back := len(buf) - pos) > 0:
+            out += f"\x1b[{back}D"
+        sys.stdout.write(out)
+        sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[?2004h")  # enable bracketed paste
+        redraw()
+        while True:
+            key = _read_key()
+            kind = key[0]
+            if kind == "enter":
+                break
+            if kind == "interrupt":
+                raise KeyboardInterrupt
+            if kind == "eof":
+                if not buf:
+                    raise EOFError
+                continue
+            if kind == "char":
+                buf.insert(pos, key[1]); pos += 1
+            elif kind == "backspace":
+                if pos > 0:
+                    del buf[pos - 1]; pos -= 1
+            elif kind == "delete":
+                if pos < len(buf):
+                    del buf[pos]
+            elif kind == "left":
+                pos = max(0, pos - 1)
+            elif kind == "right":
+                pos = min(len(buf), pos + 1)
+            elif kind == "home":
+                pos = 0
+            elif kind == "end":
+                pos = len(buf)
+            elif kind == "paste":
+                inserted = _insert_paste(key[1], images)
+                buf[pos:pos] = list(inserted); pos += len(inserted)
+            elif kind == "paste-image":
+                attachment = _grab_clipboard_image()
+                if attachment is None:
+                    sys.stdout.write("\a")  # nothing usable on the clipboard
+                else:
+                    images.append(attachment)
+                    token = f"[Image #{len(images)}]"
+                    buf[pos:pos] = list(token); pos += len(token)
+            redraw()
+        pos = len(buf)
+        redraw()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    finally:
+        sys.stdout.write("\x1b[?2004l")  # disable bracketed paste
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    return "".join(buf), images
+
+
+def read_request(prompt: str):
+    """Read input and return ``(clean_text, images)``.
+
+    Wraps :func:`read_prompt` and additionally scans the final text for *typed*
+    (non-pasted) image paths, continuing the same ``[Image #N]`` numbering.
+    """
+    text, images = read_prompt(prompt)
+    clean, typed, notes = extract_images(text, start_index=len(images))
+    _report_image_notes(notes)  # pasted images already showed as a live token
+    return clean.strip(), images + typed
 
 
 # ---------------------------------------------------------------------------
@@ -496,10 +735,15 @@ def get_or_create_profile() -> core.UserProfile:
 # Ask / chat mode
 # ---------------------------------------------------------------------------
 
-def ask_once(engine: core.Engine, profile: core.UserProfile, question: str) -> None:
-    """Answer a single inline question (e.g. ``ask how do permissions work``)."""
-    question, images, notes = extract_images(question)
-    _report_image_notes(notes)
+def ask_once(
+    engine: core.Engine, profile: core.UserProfile, question: str, images=None
+) -> None:
+    """Answer a single inline question (e.g. ``ask how do permissions work``).
+
+    ``question`` may already contain ``[Image #N]`` placeholders, with the
+    matching ``images`` attached by the caller's editor.
+    """
+    images = images or []
     if images and _only_placeholders(question):
         question = "Describe the attached image(s) and answer based on them."
     try:
@@ -532,25 +776,23 @@ def run_chat(engine: core.Engine, profile: core.UserProfile) -> None:
         )
     )
 
-    history: list[dict[str, str]] = []
+    history: list[dict] = []
     while True:
         try:
-            question = Prompt.ask("[bold blue]ask[/]").strip()
+            question, images = read_request("[bold blue]ask[/]")
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Leaving chat.[/]")
             return
-        if not question:
+        if not question and not images:
             continue
         if question.lower() in {"back", "exit", "quit"}:
             console.print("[dim]Leaving chat.[/]")
             return
 
-        clean_question, images, notes = extract_images(question)
-        _report_image_notes(notes)
-        if images and _only_placeholders(clean_question):
-            clean_question = "Describe the attached image(s) and answer based on them."
+        if images and _only_placeholders(question):
+            question = "Describe the attached image(s) and answer based on them."
 
-        history.append(core.user_message(clean_question, images))
+        history.append(core.user_message(question, images))
         try:
             answer, cancelled = run_with_cancel(
                 lambda: engine.ask(history, profile), "[cyan]Thinking…[/]"
@@ -641,9 +883,10 @@ def _print_help() -> None:
                 "[cyan]help[/]      Show this help\n"
                 "[cyan]exit[/]      Quit (Ctrl-D also works)\n\n"
                 "[dim]Tip: a leading slash is optional — [/][cyan]/ask[/][dim] works too.[/]\n"
-                "[dim]Tip: attach an image for context by including its path, e.g.[/]\n"
-                '[dim]  [/][cyan]why does this fail? ~/screenshot.png[/][dim] '
-                "(needs a vision-capable model).[/]"
+                "[dim]Tip: attach an image for context — paste a screenshot, press[/] "
+                "[cyan]Ctrl-V[/] [dim]for the clipboard image, or include a path like[/]\n"
+                '[dim]  [/][cyan]why does this fail? ~/screenshot.png[/][dim] — it shows as[/] '
+                "[cyan][Image #1][/][dim] (needs a vision-capable model).[/]"
             ),
             title="Help",
             border_style=ACCENT,
@@ -714,24 +957,24 @@ def main() -> None:
 
     while True:
         try:
-            request = Prompt.ask(
+            request, images = read_request(
                 f"\n[bold cyan]>[/] [dim]({engine.spec.key}:{engine.model})[/]"
-            ).strip()
+            )
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye.[/]")
             break
 
-        if not request:
+        if not request and not images:
             continue
 
         # A leading slash is optional on commands (so /ask, /help also work).
         if request.startswith("/"):
             request = request[1:].lstrip()
-            if not request:
+            if not request and not images:
                 continue
 
         command_word = request.lower()
-        first_word = command_word.split(maxsplit=1)[0]
+        first_word = command_word.split(maxsplit=1)[0] if command_word else ""
         if command_word in {"exit", "quit"}:
             console.print("[dim]Goodbye.[/]")
             break
@@ -741,8 +984,8 @@ def main() -> None:
         if first_word in {"ask", "chat"}:
             parts = request.split(maxsplit=1)
             inline_question = parts[1].strip() if len(parts) > 1 else ""
-            if inline_question:
-                ask_once(engine, profile, inline_question)
+            if inline_question or images:
+                ask_once(engine, profile, inline_question, images)
             else:
                 run_chat(engine, profile)
             continue
@@ -770,9 +1013,7 @@ def main() -> None:
                 console.print("\n[dim]Profile unchanged.[/]")
             continue
 
-        # --- Pull out any attached image paths for extra context -------------
-        request, images, image_notes = extract_images(request)
-        _report_image_notes(image_notes)
+        # --- Attached images were already parsed by the line editor ----------
         if images and _only_placeholders(request):
             request = "Use the attached image(s) to determine the right command."
 
