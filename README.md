@@ -210,6 +210,15 @@ on homelab what's using the most disk?
 on all uptime          # fan out to every host (and local)
 ```
 
+You don't even need `use` — just name a host in the request and Sentinel targets
+it, routing read-only questions straight to the matching diagnostic:
+
+```
+how is my homelab's cpu usage looking?     # → cpu diagnostic on homelab
+what's the vm disk usage?                   # → disk diagnostic on the vm
+restart nginx on homelab                    # → translated + run on homelab
+```
+
 Agents use two tokens: a **read** token (diagnostics — safe to give an AI) and an
 **admin** token (`/execute`, disabled unless set). See
 [`agent/README.md`](agent/README.md) for setup and the safety model.

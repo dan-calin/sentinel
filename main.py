@@ -1362,6 +1362,47 @@ def _resolve_diagnostic(name: str) -> str | None:
     return name if name in _DIAGNOSTIC_FUNCS else None
 
 
+# Natural-language routing: detect a registered host named in the request, and
+# whether the request is a read-only "how is X looking?" diagnostic question.
+_ACTION_CUES = frozenset({
+    "delete", "remove", "rm", "stop", "start", "restart", "install", "uninstall",
+    "kill", "create", "make", "mkdir", "move", "copy", "edit", "change", "set",
+    "enable", "disable", "reboot", "shutdown", "clear", "truncate", "write",
+    "chmod", "chown", "update", "upgrade", "purge", "mount", "unmount", "run",
+})
+_STATUS_CUES = ("how", "what", "show", "looking", "usage", "status", "health",
+                "check", "doing", "report", "?")
+
+
+def _detect_host(text: str) -> str | None:
+    """Return the first registered host name mentioned in the request, if any."""
+    low = text.lower()
+    for name in _hosts:
+        if re.search(rf"\b{re.escape(name.lower())}\b", low):
+            return name
+    return None
+
+
+def _strip_host_ref(text: str, name: str) -> str:
+    """Remove a host reference (e.g. 'on homelab', \"homelab's\") from a request."""
+    text = re.sub(rf"\b(?:my|the|on|for|in)\s+{re.escape(name)}(?:'s|s')?\b", "", text, flags=re.I)
+    text = re.sub(rf"\b{re.escape(name)}(?:'s|s')?\b", "", text, flags=re.I)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _diagnostic_intent(text: str) -> str | None:
+    """Map a read-only 'how is <metric> looking?' question to a diagnostic name."""
+    low = text.lower()
+    if set(re.findall(r"[a-z]+", low)) & _ACTION_CUES:   # an action → not a read
+        return None
+    if not any(cue in low for cue in _STATUS_CUES):
+        return None
+    for keyword, canonical in _DIAGNOSTIC_ALIASES.items():
+        if re.search(rf"\b{re.escape(keyword)}\b", low):
+            return canonical
+    return None
+
+
 def run_diagnostic(engine: core.Engine, profile: core.UserProfile, target: str, name: str) -> None:
     """Run a read-only diagnostic on a target (local or a remote agent) and show it."""
     canonical = _resolve_diagnostic(name)
@@ -1545,8 +1586,8 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row(Text.from_markup(f"[bold {ACCENT}]Getting started[/]"))
     right.add_row(Text.from_markup("Describe a task in plain English, e.g."))
     right.add_row(Text.from_markup("  [cyan]\"what errors hit the journal this hour?\"[/]"))
-    right.add_row(Text.from_markup("  [cyan]\"which processes use the most memory?\"[/]"))
-    right.add_row(Text.from_markup("[dim]Add an image path for context: [/][cyan]why this error? ~/err.png[/]"))
+    right.add_row(Text.from_markup("  [cyan]\"how is my homelab's cpu usage looking?\"[/]"))
+    right.add_row(Text.from_markup("[dim]Name a host to target it; add one with [/][cyan]host add[/]"))
     right.add_row("")
     right.add_row(Text.from_markup(f"[bold {ACCENT}]Commands[/]"))
     right.add_row(Text.from_markup("[cyan]ask[/]       ask a Linux question"))
@@ -1601,6 +1642,8 @@ def _print_help() -> None:
                 "[cyan]on <host|all> <request>[/] runs one-off\n"
                 "[cyan]status[/] [dim][host][/]  Full health snapshot; [cyan]diag <cpu|memory|"
                 "disk|power|…> [host][/] for one metric\n"
+                "[dim]Or just name a host in a question — [/][cyan]\"how is my homelab's "
+                "cpu looking?\"[/][dim] — no [/][cyan]use[/][dim] needed.[/]\n"
                 "[cyan]profile[/]   Re-take the experience questionnaire (sets how "
                 "commands are explained)\n"
                 "[cyan]help[/]      Show this help\n"
@@ -1824,7 +1867,19 @@ def main() -> None:
                 handle_request(engine, profile, sub_request, images, destination)
             continue
 
-        handle_request(engine, profile, request, images, _target)
+        # Natural-language targeting: a host named in the request wins over the
+        # active target, and a read-only metric question goes straight to the
+        # reliable diagnostic (no `use`, no `diag` needed).
+        detected = _detect_host(request)
+        active = detected or _target
+        intent = _diagnostic_intent(request) if not images else None
+        if intent:
+            run_diagnostic(engine, profile, active, intent)
+            continue
+        if detected:
+            handle_request(engine, profile, _strip_host_ref(request, detected), images, detected)
+        else:
+            handle_request(engine, profile, request, images, _target)
 
 
 if __name__ == "__main__":
