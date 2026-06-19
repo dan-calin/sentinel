@@ -147,9 +147,10 @@ straight to the prompt with no menus and no re-entering keys.
 ## Architecture
 
 ```
-core.py      all logic, no UI (engines, safety filter, profile, settings, execution)
+core.py      all logic, no UI (engines, safety filter, profile, settings, fleet, execution)
 main.py      the terminal UI (built on rich)
 mcp_server/  MCP server — exposes the host to AIs as a connectable skill
+agent/       per-host HTTP agent so the CLI can manage remote machines (fleet)
 gui/         experimental web UI over the same core (paused; see gui/README.md)
 ```
 
@@ -190,6 +191,28 @@ list.
 
 ---
 
+## Manage more than one machine (fleet)
+
+Run the [`agent`](agent/README.md) on each machine you want to manage (a VM, a
+homelab box); your main Sentinel CLI becomes the **controller** that drives them
+over the LAN. The LLM, the safety blocklist, and the `y/n` gate stay on the
+controller — only execution is forwarded to the target's agent, which screens
+the command again server-side before running it.
+
+```
+host add               # register a host: name, agent URL, tokens
+hosts                  # list machines + health
+use homelab            # target a host for following requests
+on homelab what's using the most disk?
+on all uptime          # fan out to every host (and local)
+```
+
+Agents use two tokens: a **read** token (diagnostics — safe to give an AI) and an
+**admin** token (`/execute`, disabled unless set). See
+[`agent/README.md`](agent/README.md) for setup and the safety model.
+
+---
+
 ## Commands
 
 A leading slash is optional (`/ask` works too).
@@ -205,6 +228,8 @@ A leading slash is optional (`/ask` works too).
 | `history` | Show recently run commands and their undo status |
 | `undo [ID]` | Undo the last change (restore a snapshot, or run a safe inverse) |
 | `checkpoint <path>` | Snapshot a file/dir; `checkpoints` lists them, `restore [ID]` brings one back |
+| `hosts` / `host add` / `host remove <name>` | Manage machines in the fleet |
+| `use <host>` / `on <host\|all> <request>` | Target a host; run a one-off on one or all |
 | `profile` | Re-take the experience questionnaire |
 | `help` | Show the command reference |
 | `exit` | Quit (Ctrl-D also works) |
@@ -226,6 +251,8 @@ A leading slash is optional (`/ask` works too).
 - **History and checkpoints** live under `~/.config/sentinel/` (`history.jsonl`
   and `checkpoints/`); snapshots are size-capped and are a convenience, not a
   backup system.
+- **Fleet hosts** (names, agent URLs, and tokens) are saved to
+  `~/.config/sentinel/hosts.json`, written `chmod 600` since it holds tokens.
 
 ---
 
@@ -238,9 +265,10 @@ A leading slash is optional (`/ask` works too).
 - [x] Attach images (paste, Ctrl-V, or path) with inline `[Image #N]` tokens.
 - [x] Vision fallback so text-only models can still read images.
 - [x] Undo / checkpoints for commands that change the system.
-- [ ] Multi-host / fleet: report on more than the local machine (homelab + box).
+- [x] Multi-host fleet: per-host agents the CLI controls (`agent/`).
+- [ ] Remote undo/checkpoints and per-host environment grounding.
+- [ ] Streamable-HTTP MCP transport so AIs connect to an agent directly.
 - [ ] Web GUI (paused under `gui/` while the design is reworked).
-- [ ] Remote execution (SSH) and an allow-list mode beyond V1's local execution.
 
 ---
 

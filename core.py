@@ -626,6 +626,130 @@ def save_settings(settings: Settings) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Fleet: hosts and remote agents
+#
+# A controller (the CLI) keeps a registry of hosts, each running a Sentinel
+# agent (see agent/server.py). "local" is implicit and always available. Remote
+# hosts are reached over HTTP with a read token (diagnostics) and an optional
+# admin token (execute). Tokens live in hosts.json, written chmod 600.
+# ---------------------------------------------------------------------------
+
+LOCAL_HOST = "local"
+
+
+@dataclass
+class HostConfig:
+    """A managed host: where its agent lives and the tokens to reach it."""
+
+    name: str
+    base_url: str
+    read_token: str = ""
+    admin_token: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name, "base_url": self.base_url,
+            "read_token": self.read_token, "admin_token": self.admin_token,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HostConfig":
+        return cls(
+            name=str(data.get("name", "")), base_url=str(data.get("base_url", "")),
+            read_token=str(data.get("read_token", "")),
+            admin_token=str(data.get("admin_token", "")),
+        )
+
+
+def hosts_path() -> Path:
+    return _config_dir() / "hosts.json"
+
+
+def load_hosts() -> dict[str, HostConfig]:
+    """Load the host registry (name -> HostConfig); empty if none saved."""
+    try:
+        with hosts_path().open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    hosts = {}
+    for item in data.get("hosts", []):
+        host = HostConfig.from_dict(item)
+        if host.name and host.name != LOCAL_HOST:
+            hosts[host.name] = host
+    return hosts
+
+
+def save_hosts(hosts: dict[str, HostConfig]) -> bool:
+    """Persist the host registry with owner-only permissions (holds tokens)."""
+    path = hosts_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump({"hosts": [h.to_dict() for h in hosts.values()]}, handle, indent=2)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+
+class RemoteError(RuntimeError):
+    """Raised when talking to a remote agent fails, with a readable message."""
+
+
+class RemoteAgent:
+    """Thin HTTP client for a Sentinel agent (stdlib only)."""
+
+    def __init__(self, host: HostConfig, timeout: float = 30.0) -> None:
+        self.host = host
+        self.timeout = timeout
+
+    def _request(self, method: str, path: str, token: str, body: dict | None = None) -> dict:
+        import urllib.error
+        import urllib.request
+
+        url = self.host.base_url.rstrip("/") + path
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode() or "{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            try:
+                detail = json.loads(detail).get("detail", detail)
+            except json.JSONDecodeError:
+                pass
+            raise RemoteError(f"{exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RemoteError(f"could not reach {self.host.name} ({url}): {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise RemoteError(f"could not reach {self.host.name}: {exc}") from exc
+
+    def health(self) -> dict:
+        return self._request("GET", "/health", token="")
+
+    def diagnostic(self, name: str, params: dict | None = None) -> str:
+        body = {"params": params or {}}
+        result = self._request("POST", f"/diagnostics/{name}", self.host.read_token, body)
+        return result.get("output", "")
+
+    def execute(self, command: str) -> "CommandResult":
+        result = self._request("POST", "/execute", self.host.admin_token, {"command": command})
+        return CommandResult(
+            exit_code=int(result.get("exit_code", EXIT_COULD_NOT_RUN)),
+            stdout=result.get("stdout", ""), stderr=result.get("stderr", ""),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Safety filter (read-only V1)
 #
 # Conservative backstop matching unambiguously destructive operations. It runs
@@ -1187,13 +1311,14 @@ class JournalEntry:
     mutating: bool
     checkpoint_id: str | None = None
     undone: bool = False
+    host: str = LOCAL_HOST
 
     def to_dict(self) -> dict:
         return {
             "id": self.id, "timestamp": self.timestamp, "request": self.request,
             "command": self.command, "cwd": self.cwd, "exit_code": self.exit_code,
             "mutating": self.mutating, "checkpoint_id": self.checkpoint_id,
-            "undone": self.undone,
+            "undone": self.undone, "host": self.host,
         }
 
     @classmethod
@@ -1204,6 +1329,7 @@ class JournalEntry:
             cwd=data.get("cwd", ""), exit_code=int(data.get("exit_code", 0)),
             mutating=bool(data.get("mutating", False)),
             checkpoint_id=data.get("checkpoint_id"), undone=bool(data.get("undone", False)),
+            host=data.get("host") or LOCAL_HOST,
         )
 
 
@@ -1213,12 +1339,13 @@ def _journal_path() -> Path:
 
 def record_command(
     request: str, command: str, cwd: str, exit_code: int,
-    mutating: bool, checkpoint_id: str | None,
+    mutating: bool, checkpoint_id: str | None, host: str = LOCAL_HOST,
 ) -> JournalEntry | None:
     """Append an executed command to the journal (best-effort)."""
     entry = JournalEntry(
         id=_new_id(), timestamp=_now_iso(), request=request, command=command,
         cwd=cwd, exit_code=exit_code, mutating=mutating, checkpoint_id=checkpoint_id,
+        host=host,
     )
     try:
         path = _journal_path()

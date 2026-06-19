@@ -1220,6 +1220,219 @@ def do_restore(arg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fleet: hosts and targeting
+#
+# The controller (this CLI) can run a request against the local machine or a
+# remote host running a Sentinel agent. `_target` is the active host; commands
+# `hosts` / `host add` / `use` / `on` manage and select it.
+# ---------------------------------------------------------------------------
+
+_hosts: dict[str, core.HostConfig] = {}
+_target: str = core.LOCAL_HOST
+
+
+def _known_target(name: str) -> bool:
+    return name == core.LOCAL_HOST or name in _hosts
+
+
+def _print_hosts() -> None:
+    """List the controller's hosts and probe each remote agent's health."""
+    table = Table(title="Hosts", title_style=f"bold {ACCENT}", expand=False)
+    table.add_column("", width=1)
+    table.add_column("Name", style="bold")
+    table.add_column("Where")
+    table.add_column("Status")
+    table.add_column("Execute", style="dim")
+
+    marker = "[green]›[/]" if _target == core.LOCAL_HOST else " "
+    table.add_row(marker, core.LOCAL_HOST, "this machine", "[green]ready[/]", "yes")
+    for name, host in _hosts.items():
+        status, execute = "[yellow]unknown[/]", "—"
+        try:
+            health = core.RemoteAgent(host, timeout=5).health()
+            status = "[green]online[/]"
+            execute = "yes" if health.get("exec_enabled") and host.admin_token else "read-only"
+        except core.RemoteError:
+            status = "[red]offline[/]"
+        marker = "[green]›[/]" if _target == name else " "
+        table.add_row(marker, name, host.base_url, status, execute)
+    console.print(table)
+    console.print(
+        "[dim]Switch with [/][cyan]use <name>[/][dim], run one-off with [/]"
+        "[cyan]on <name> <request>[/][dim] or [/][cyan]on all <request>[/][dim].[/]"
+    )
+
+
+def host_add_interactive() -> None:
+    """Prompt for a remote host's URL and tokens, then save it."""
+    name = Prompt.ask("Host name (e.g. vm, homelab)").strip()
+    if not name or name == core.LOCAL_HOST:
+        console.print("[yellow]Pick a non-empty name other than 'local'.[/]")
+        return
+    base_url = Prompt.ask("Agent URL (e.g. http://192.168.1.20:8765)").strip()
+    if not base_url:
+        console.print("[yellow]A URL is required.[/]")
+        return
+    read_token = Prompt.ask("Read token [dim](diagnostics)[/]", password=True, default="")
+    admin_token = Prompt.ask(
+        "Admin token [dim](execute; leave blank for read-only)[/]", password=True, default=""
+    )
+    host = core.HostConfig(name=name, base_url=base_url, read_token=read_token, admin_token=admin_token)
+    try:
+        health = core.RemoteAgent(host, timeout=5).health()
+        console.print(f"[green]Reached {name}[/] [dim]({health.get('os', '?')}).[/]")
+    except core.RemoteError as exc:
+        console.print(f"[yellow]Saved, but couldn't reach it yet:[/] {exc}")
+    _hosts[name] = host
+    core.save_hosts(_hosts)
+    console.print(f"[green]Host '{name}' saved.[/] [dim]Use it with[/] [cyan]use {name}[/][dim].[/]")
+
+
+def host_remove(name: str) -> None:
+    if name in _hosts:
+        del _hosts[name]
+        core.save_hosts(_hosts)
+        global _target
+        if _target == name:
+            _target = core.LOCAL_HOST
+        console.print(f"[green]Removed host '{name}'.[/]")
+    else:
+        console.print(f"[yellow]No such host: {name}[/]")
+
+
+def execute_on(target: str, command: str):
+    """Run an approved command on a target. Returns (CommandResult|None, cancelled)."""
+    if target == core.LOCAL_HOST:
+        cancel_event = threading.Event()
+        return run_with_cancel(
+            lambda: core.run_command(command, cancel_event),
+            "[cyan]Running…[/]", cancel_event=cancel_event,
+        )
+    host = _hosts.get(target)
+    if host is None:
+        console.print(f"[red]Unknown host:[/] {target}")
+        return None, False
+    if not host.admin_token:
+        console.print(
+            f"[yellow]{target} is read-only — no admin token.[/] "
+            f"[dim]Add one with[/] [cyan]host add[/][dim].[/]"
+        )
+        return None, False
+    agent = core.RemoteAgent(host)
+    try:
+        return run_with_cancel(
+            lambda: agent.execute(command), f"[cyan]Running on {target}…[/]"
+        )
+    except core.RemoteError as exc:
+        console.print(f"[red]{target}:[/] {exc}")
+        return None, False
+
+
+def handle_request(
+    engine: core.Engine, profile: core.UserProfile, request: str, images, target: str,
+) -> None:
+    """Translate a request, screen + confirm it, run it on ``target``, summarize.
+
+    The full read→translate→approve→execute flow for one request, factored out so
+    the main loop, ``on <host>``, and ``on all`` all share it.
+    """
+    if images and _only_placeholders(request):
+        request = "Use the attached image(s) to determine the right command."
+
+    # Translate (with a vision-bridge fallback for text-only models).
+    try:
+        command, cancelled = run_with_cancel(
+            lambda: engine.translate(request, images), "[cyan]Translating…[/]"
+        )
+    except core.TranslationError as exc:
+        augmented = _bridge_request(engine, request, images, str(exc))
+        if augmented is None:
+            console.print(f"[bold red]Translation failed:[/] {exc}{_vision_hint(images, str(exc))}")
+            return
+        try:
+            request = augmented
+            command, cancelled = run_with_cancel(
+                lambda: engine.translate(augmented), "[cyan]Translating…[/]"
+            )
+        except core.TranslationError as exc2:
+            console.print(f"[bold red]Translation failed:[/] {exc2}")
+            return
+    if cancelled:
+        console.print("[dim]Cancelled.[/]")
+        return
+    if not command or command == core.UNSUPPORTED_SENTINEL:
+        console.print(
+            "[yellow]That isn't a Linux operation I can run.[/] "
+            "[dim]Try e.g. [/][cyan]\"how much disk is free?\"[/][dim].[/]"
+        )
+        return
+
+    # Safety filter (defense in depth, before any prompt).
+    verdict = core.screen_command(command)
+    if not verdict.allowed:
+        console.print(Panel(
+            Text.from_markup(f"[bold]Blocked command:[/]\n  [red]{command}[/]\n\n[bold]Reason:[/] {verdict.reason}"),
+            title="[bold red]🛑 Refused by safety filter[/]", border_style="red", title_align="left",
+        ))
+        return
+
+    # Optional, profile-aware explanation (best-effort).
+    explanation = ""
+    if profile.explain:
+        try:
+            explanation, cancelled = run_with_cancel(
+                lambda: engine.explain(command, profile), "[cyan]Explaining…[/]"
+            )
+        except core.TranslationError:
+            explanation = ""
+        else:
+            if cancelled:
+                console.print("[dim]Cancelled.[/]")
+                return
+
+    # Human confirmation gate — the heart of the safety model.
+    where = "" if target == core.LOCAL_HOST else f" on [bold]{target}[/]"
+    if where:
+        console.print(f"[dim]Target:[/]{where}")
+    if not confirm_execution(command, explanation):
+        console.print("[dim]Skipped — nothing was run.[/]")
+        return
+
+    # Snapshot files this command will touch (local target only — we can't
+    # snapshot a remote host's files from here yet).
+    mutating, targets = core.classify_command(command)
+    checkpoint = None
+    if target == core.LOCAL_HOST and mutating and targets:
+        checkpoint = core.create_checkpoint(command, targets)
+        if checkpoint and checkpoint.saved_count:
+            console.print(f"[dim]Checkpoint {checkpoint.id} saved — undo with[/] [cyan]undo[/][dim].[/]")
+
+    result, cancelled = execute_on(target, command)
+    if result is None:
+        return
+    _render_result(result)
+    core.record_command(
+        request, command, os.getcwd(), result.exit_code, mutating,
+        checkpoint.id if checkpoint else None, host=target,
+    )
+    if cancelled:
+        console.print("[yellow]Cancelled — the command was stopped.[/]")
+        return
+
+    # Plain-English answer derived from the output (best-effort).
+    if profile.explain:
+        try:
+            summary, cancelled = run_with_cancel(
+                lambda: engine.summarize(request, command, result, profile),
+                "[cyan]Summarizing result…[/]",
+            )
+            if summary and not cancelled:
+                _print_summary(summary)
+        except core.TranslationError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Welcome box & help
 # ---------------------------------------------------------------------------
 
@@ -1255,6 +1468,7 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row(Text.from_markup("[cyan]model[/]     pick / refresh model"))
     right.add_row(Text.from_markup("[cyan]vision[/]    image fallback model"))
     right.add_row(Text.from_markup("[cyan]undo[/]      undo the last change · [cyan]history[/]"))
+    right.add_row(Text.from_markup("[cyan]hosts[/]     manage machines · [cyan]on <host> …[/]"))
     right.add_row(Text.from_markup("[cyan]profile[/]   tune explanation level"))
     right.add_row(Text.from_markup("[cyan]help[/] · [cyan]exit[/]"))
     right.add_row("")
@@ -1294,6 +1508,10 @@ def _print_help() -> None:
                 "run a safe inverse command)\n"
                 "[cyan]checkpoint[/] <path>  Snapshot a file/dir; [cyan]checkpoints[/] "
                 "lists them, [cyan]restore[/] [dim][ID][/] brings one back\n"
+                "[cyan]hosts[/]     List machines; [cyan]host add[/] / [cyan]host remove <name>[/] "
+                "manage them\n"
+                "[cyan]use[/] <host>  Target a host for following commands; "
+                "[cyan]on <host|all> <request>[/] runs one-off\n"
                 "[cyan]profile[/]   Re-take the experience questionnaire (sets how "
                 "commands are explained)\n"
                 "[cyan]help[/]      Show this help\n"
@@ -1359,8 +1577,9 @@ def main() -> None:
 
     load_dotenv()  # Reads .env into the environment if present.
 
-    global _settings
+    global _settings, _hosts
     _settings = core.load_settings()  # remembered provider/model/keys
+    _hosts = core.load_hosts()        # registered remote hosts (fleet)
 
     try:
         profile = get_or_create_profile()
@@ -1371,10 +1590,12 @@ def main() -> None:
     engine = _startup_engine()
     _print_banner(engine, profile)
 
+    global _target
     while True:
+        target_tag = "" if _target == core.LOCAL_HOST else f"{_target} · "
         try:
             request, images = read_request(
-                f"\n[bold cyan]>[/] [dim]({engine.spec.key}:{engine.model})[/]"
+                f"\n[bold cyan]>[/] [dim]({target_tag}{engine.spec.key}:{engine.model})[/]"
             )
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye.[/]")
@@ -1458,114 +1679,52 @@ def main() -> None:
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Restore cancelled.[/]")
             continue
-
-        # --- Attached images were already parsed by the line editor ----------
-        if images and _only_placeholders(request):
-            request = "Use the attached image(s) to determine the right command."
-
-        # --- Translate (with a vision bridge fallback for text-only models) ---
-        try:
-            command, cancelled = run_with_cancel(
-                lambda: engine.translate(request, images), "[cyan]Translating…[/]"
-            )
-        except core.TranslationError as exc:
-            augmented = _bridge_request(engine, request, images, str(exc))
-            if augmented is None:
-                console.print(
-                    f"[bold red]Translation failed:[/] {exc}{_vision_hint(images, str(exc))}"
-                )
-                continue
+        if command_word == "hosts":
+            _print_hosts()
+            continue
+        if first_word == "host":
+            parts = request.split(maxsplit=2)
+            sub = parts[1].lower() if len(parts) > 1 else ""
             try:
-                request = augmented
-                command, cancelled = run_with_cancel(
-                    lambda: engine.translate(augmented), "[cyan]Translating…[/]"
-                )
-            except core.TranslationError as exc2:
-                console.print(f"[bold red]Translation failed:[/] {exc2}")
-                continue
-        if cancelled:
-            console.print("[dim]Cancelled.[/]")
+                if sub == "add":
+                    host_add_interactive()
+                elif sub in {"remove", "rm", "del"} and len(parts) > 2:
+                    host_remove(parts[2].strip())
+                else:
+                    console.print("[dim]Usage: [/][cyan]host add[/][dim] or [/][cyan]host remove <name>[/][dim].[/]")
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Cancelled.[/]")
             continue
-
-        if not command or command == core.UNSUPPORTED_SENTINEL:
-            console.print(
-                "[yellow]That isn't a Linux operation I can run.[/] "
-                "[dim]I translate plain-English system tasks into shell "
-                'commands — try e.g. [/][cyan]"how much disk is free?"[/] '
-                "[dim]or[/] [cyan]\"list running processes\"[/][dim].[/]"
-            )
-            continue
-
-        # --- Safety filter (defense in depth, before any prompt) --------------
-        verdict = core.screen_command(command)
-        if not verdict.allowed:
-            console.print(
-                Panel(
-                    Text.from_markup(
-                        f"[bold]Blocked command:[/]\n  [red]{command}[/]\n\n"
-                        f"[bold]Reason:[/] {verdict.reason}"
-                    ),
-                    title="[bold red]🛑 Refused by safety filter[/]",
-                    border_style="red",
-                    title_align="left",
-                )
-            )
-            continue
-
-        # --- Optional, profile-aware explanation (best-effort) ----------------
-        explanation = ""
-        if profile.explain:
-            try:
-                explanation, cancelled = run_with_cancel(
-                    lambda: engine.explain(command, profile), "[cyan]Explaining…[/]"
-                )
-            except core.TranslationError:
-                explanation = ""
+        if first_word == "use":
+            parts = request.split(maxsplit=1)
+            name = parts[1].strip() if len(parts) > 1 else ""
+            if _known_target(name):
+                _target = name
+                console.print(f"[green]Target set to[/] [bold]{name}[/].")
             else:
-                if cancelled:
-                    console.print("[dim]Cancelled.[/]")
-                    continue
-
-        # --- Human confirmation gate — the heart of the safety model ----------
-        if not confirm_execution(command, explanation):
-            console.print("[dim]Skipped — nothing was run.[/]")
+                console.print(f"[yellow]Unknown host '{name}'.[/] [dim]See[/] [cyan]hosts[/][dim].[/]")
+            continue
+        if first_word == "on":
+            parts = request.split(maxsplit=2)
+            dest = parts[1] if len(parts) > 1 else ""
+            sub_request = parts[2].strip() if len(parts) > 2 else ""
+            if not dest or not sub_request:
+                console.print("[dim]Usage: [/][cyan]on <host|all> <request>[/][dim].[/]")
+                continue
+            if dest == "all":
+                destinations = [core.LOCAL_HOST, *_hosts]
+            elif _known_target(dest):
+                destinations = [dest]
+            else:
+                console.print(f"[yellow]Unknown host '{dest}'.[/] [dim]See[/] [cyan]hosts[/][dim].[/]")
+                continue
+            for destination in destinations:
+                if len(destinations) > 1:
+                    console.rule(f"[bold {ACCENT}]{destination}[/]")
+                handle_request(engine, profile, sub_request, images, destination)
             continue
 
-        # Snapshot any files this command will touch, so it can be undone.
-        mutating, targets = core.classify_command(command)
-        checkpoint = core.create_checkpoint(command, targets) if (mutating and targets) else None
-        if checkpoint and checkpoint.saved_count:
-            console.print(
-                f"[dim]Checkpoint {checkpoint.id} saved — undo with[/] [cyan]undo[/][dim].[/]"
-            )
-
-        # Execution is cancellable: Esc terminates the running command.
-        cancel_event = threading.Event()
-        result, cancelled = run_with_cancel(
-            lambda: core.run_command(command, cancel_event),
-            "[cyan]Running…[/]",
-            cancel_event=cancel_event,
-        )
-        _render_result(result)
-        core.record_command(
-            request, command, os.getcwd(), result.exit_code, mutating,
-            checkpoint.id if checkpoint else None,
-        )
-        if cancelled:
-            console.print("[yellow]Cancelled — the command was stopped.[/]")
-            continue
-
-        # --- Plain-English answer derived from the output (best-effort) -------
-        if profile.explain:
-            try:
-                summary, cancelled = run_with_cancel(
-                    lambda: engine.summarize(request, command, result, profile),
-                    "[cyan]Summarizing result…[/]",
-                )
-                if summary and not cancelled:
-                    _print_summary(summary)
-            except core.TranslationError:
-                pass
+        handle_request(engine, profile, request, images, _target)
 
 
 if __name__ == "__main__":

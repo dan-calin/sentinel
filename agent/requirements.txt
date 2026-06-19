@@ -1,0 +1,8 @@
+# Sentinel agent dependencies. Install on each host you want to manage:
+#   pip install -r requirements.txt -r agent/requirements.txt
+#
+# The agent reuses the project's core.py and the diagnostics catalog, so install
+# the root requirements too.
+
+fastapi~=0.137   # HTTP API exposed to the controller (and read-only to AIs)
+uvicorn~=0.49    # ASGI server to run it
