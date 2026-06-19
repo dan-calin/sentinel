@@ -19,6 +19,7 @@ be bypassed by a client.
 from __future__ import annotations
 
 import abc
+import base64
 import json
 import os
 import platform
@@ -124,6 +125,92 @@ def environment_context() -> str:
         "directories (e.g. use 'mkdir -p'), or operate relative to the home "
         "directory or an absolute path the user names."
     )
+
+
+# ---------------------------------------------------------------------------
+# Image attachments
+#
+# Users can attach images (a screenshot of an error, terminal output, a
+# dashboard) to give the model more context. We carry images in a neutral,
+# provider-agnostic form; each engine converts them to its own image schema in
+# `_chat`. Whether the image is actually *understood* depends on the chosen
+# model being vision-capable — nearly all current frontier models are, and a
+# model that isn't will surface a provider error, which the UI reports.
+# ---------------------------------------------------------------------------
+
+# Extension -> MIME type for the formats every major vision model accepts.
+SUPPORTED_IMAGE_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# Per-image ceiling. Anthropic rejects images much larger than this, and it
+# keeps request size (and cost) sane.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+class ImageError(ValueError):
+    """Raised when an image cannot be loaded (missing, too big, wrong type)."""
+
+
+@dataclass(frozen=True)
+class ImageAttachment:
+    """A single image carried with a request, ready to send to any provider."""
+
+    media_type: str
+    data: str          # base64-encoded bytes
+    source: str = ""   # original path, for display only
+
+
+def load_image(path: str) -> ImageAttachment:
+    """Load an image file into an :class:`ImageAttachment`.
+
+    Raises:
+        ImageError: If the path is missing, the type is unsupported, or the
+            file is empty or larger than :data:`MAX_IMAGE_BYTES`.
+    """
+    resolved = Path(os.path.expanduser(path))
+    ext = resolved.suffix.lower()
+    if ext not in SUPPORTED_IMAGE_TYPES:
+        supported = ", ".join(sorted(SUPPORTED_IMAGE_TYPES))
+        raise ImageError(f"unsupported image type '{ext or path}' (supported: {supported})")
+    try:
+        raw = resolved.read_bytes()
+    except OSError as exc:
+        raise ImageError(f"could not read '{path}': {exc}") from exc
+    if not raw:
+        raise ImageError(f"'{path}' is empty")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ImageError(
+            f"'{path}' is {len(raw) // (1024 * 1024)} MB; the limit is "
+            f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB"
+        )
+    return ImageAttachment(
+        media_type=SUPPORTED_IMAGE_TYPES[ext],
+        data=base64.b64encode(raw).decode("ascii"),
+        source=str(resolved),
+    )
+
+
+def user_message(text: str, images: "list[ImageAttachment] | None" = None) -> dict:
+    """Build a user turn, attaching images as neutral content parts when present.
+
+    With no images the content is a plain string (the simple, common path). With
+    images it becomes a list of ``{"type": "text"|"image", ...}`` parts that each
+    engine maps to its provider's format. Images come first so the model reads
+    them before the instruction (the order Anthropic recommends).
+    """
+    if not images:
+        return {"role": "user", "content": text}
+    parts: list[dict] = [
+        {"type": "image", "media_type": img.media_type, "data": img.data} for img in images
+    ]
+    if text:
+        parts.append({"type": "text", "text": text})
+    return {"role": "user", "content": parts}
 
 
 # ---------------------------------------------------------------------------
@@ -715,20 +802,35 @@ class Engine(abc.ABC):
         return self.spec.label
 
     @abc.abstractmethod
-    def _chat(self, system: str, messages: list[dict[str, str]], max_tokens: int) -> str:
+    def _chat(self, system: str, messages: list[dict], max_tokens: int) -> str:
         """Run one completion (system prompt + message turns) and return text.
 
         ``messages`` is a list of ``{"role", "content"}`` turns (``user`` /
-        ``assistant``), enabling multi-turn chat.
+        ``assistant``). ``content`` is normally a string, but may be a list of
+        neutral content parts (text + images), which each engine maps to its
+        provider's multimodal format.
 
         Raises:
             TranslationError: If the provider request fails.
         """
 
-    def translate(self, request: str) -> str:
-        """Translate a natural-language request into one bash command."""
-        messages = [{"role": "user", "content": request}]
+    def translate(
+        self, request: str, images: "list[ImageAttachment] | None" = None
+    ) -> str:
+        """Translate a natural-language request into one bash command.
+
+        Optional ``images`` (e.g. a screenshot of an error) are passed to the
+        model as extra context; the output rules are unchanged.
+        """
+        messages = [user_message(request, images)]
         system = SYSTEM_PROMPT + environment_context()
+        if images:
+            system += (
+                "\n\nThe user attached one or more images for context (such as a "
+                "screenshot of an error, terminal output, or a dashboard). Use "
+                "them to inform the single command you output. Still obey every "
+                "output rule above."
+            )
         return _sanitize_command(self._chat(system, messages, MAX_TOKENS))
 
     def explain(self, command: str, profile: UserProfile) -> str:
@@ -774,7 +876,28 @@ class AnthropicEngine(Engine):
         super().__init__(spec, model)
         self._client = anthropic.Anthropic(api_key=api_key)
 
-    def _chat(self, system: str, messages: list[dict[str, str]], max_tokens: int) -> str:
+    @staticmethod
+    def _to_native(message: dict) -> dict:
+        """Convert a neutral message to Anthropic's content-block format."""
+        content = message["content"]
+        if isinstance(content, str):
+            return message
+        blocks: list[dict] = []
+        for part in content:
+            if part["type"] == "image":
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": part["media_type"],
+                        "data": part["data"],
+                    },
+                })
+            else:
+                blocks.append({"type": "text", "text": part["text"]})
+        return {"role": message["role"], "content": blocks}
+
+    def _chat(self, system: str, messages: list[dict], max_tokens: int) -> str:
         try:
             # `thinking` is omitted: the safe default across every Claude model
             # (some, like Fable, reject `disabled`), and these prompts need no
@@ -783,7 +906,7 @@ class AnthropicEngine(Engine):
                 model=self.model,
                 max_tokens=max_tokens,
                 system=system,
-                messages=messages,
+                messages=[self._to_native(m) for m in messages],
             )
         except anthropic.APIError as exc:
             raise TranslationError(str(exc)) from exc
@@ -814,12 +937,30 @@ class OpenAICompatEngine(Engine):
         # any non-empty placeholder.
         self._client = OpenAI(api_key=api_key or "not-needed", base_url=base_url)
 
-    def _chat(self, system: str, messages: list[dict[str, str]], max_tokens: int) -> str:
+    @staticmethod
+    def _to_native(message: dict) -> dict:
+        """Convert a neutral message to OpenAI's multimodal content format."""
+        content = message["content"]
+        if isinstance(content, str):
+            return message
+        parts: list[dict] = []
+        for part in content:
+            if part["type"] == "image":
+                url = f"data:{part['media_type']};base64,{part['data']}"
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+            else:
+                parts.append({"type": "text", "text": part["text"]})
+        return {"role": message["role"], "content": parts}
+
+    def _chat(self, system: str, messages: list[dict], max_tokens: int) -> str:
         try:
             response = self._client.chat.completions.create(
                 model=self.model,
                 max_tokens=max_tokens,
-                messages=[{"role": "system", "content": system}, *messages],
+                messages=[
+                    {"role": "system", "content": system},
+                    *(self._to_native(m) for m in messages),
+                ],
             )
         except Exception as exc:  # openai exception hierarchy varies by version
             raise TranslationError(str(exc)) from exc

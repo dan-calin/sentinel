@@ -1,0 +1,7 @@
+# MCP server dependencies. Install on the machine Sentinel will report on:
+#   pip install -r mcp_server/requirements.txt
+#
+# This reuses the project's core.py, which also needs the root requirements
+# (anthropic, openai, etc.) if you want the propose_command translate tool.
+
+mcp>=1.2.0

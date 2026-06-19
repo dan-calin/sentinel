@@ -15,6 +15,7 @@ a command's output back into plain English — all tuned to your experience leve
 from __future__ import annotations
 
 import os
+import re
 import select
 import sys
 import threading
@@ -206,6 +207,75 @@ def _print_summary(summary: str) -> None:
     """Render the post-execution plain-English summary of a command's output."""
     console.print(
         Panel(summary, title="[bold green]In short[/]", border_style="green", title_align="left")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Image attachments
+#
+# Users attach an image by including its path in the prompt (typing it, or just
+# dragging the file into the terminal). We pull recognized image paths out of
+# the text, load them, and pass them to the model as extra context — so
+# "why is this failing? ~/err.png" sends both the question and the screenshot.
+# ---------------------------------------------------------------------------
+
+# Image-path token: a double/single-quoted path, or a bare path (allowing
+# backslash-escaped spaces), ending in a supported image extension.
+_IMG_EXT = "|".join(sorted(ext.lstrip(".") for ext in core.SUPPORTED_IMAGE_TYPES))
+_IMG_PATH_RE = re.compile(
+    rf'"([^"]+?\.(?:{_IMG_EXT}))"'
+    rf"|'([^']+?\.(?:{_IMG_EXT}))'"
+    rf'|((?:\\ |\S)+?\.(?:{_IMG_EXT}))(?=\s|$)',
+    re.IGNORECASE,
+)
+
+
+def extract_images(text: str):
+    """Split a prompt into (clean_text, images, notes).
+
+    ``images`` are successfully loaded :class:`core.ImageAttachment` objects;
+    their paths are removed from ``clean_text``. A token that looks like an
+    image path but can't be loaded is left in the text and reported via
+    ``notes`` (a list of ``("ok"|"err", message)``), so a stray ".png" word is
+    never silently swallowed.
+    """
+    matches = list(_IMG_PATH_RE.finditer(text))
+    if not matches:
+        return text, [], []
+
+    images, notes, spans = [], [], []
+    for match in matches:
+        path = (match.group(1) or match.group(2) or match.group(3)).replace("\\ ", " ")
+        try:
+            images.append(core.load_image(path))
+            notes.append(("ok", os.path.basename(path)))
+            spans.append(match.span())
+        except core.ImageError as exc:
+            notes.append(("err", f"{path}: {exc}"))
+
+    clean = text
+    for start, end in sorted(spans, reverse=True):  # back-to-front keeps offsets valid
+        clean = clean[:start] + clean[end:]
+    clean = re.sub(r"\s{2,}", " ", clean).strip()
+    return clean, images, notes
+
+
+def _report_image_notes(notes) -> None:
+    """Print a short line per attached (or skipped) image."""
+    for kind, message in notes:
+        if kind == "ok":
+            console.print(f"[dim]Attached image: {message}[/]")
+        else:
+            console.print(f"[yellow]Skipped image[/] [dim]({message})[/]")
+
+
+def _vision_hint(images) -> str:
+    """Markup hint to append on failure when images were attached."""
+    if not images:
+        return ""
+    return (
+        "\n[dim]If the selected model can't read images, switch to a "
+        "vision-capable one (Claude, GPT, Gemini) or omit the image.[/]"
     )
 
 
@@ -415,13 +485,17 @@ def get_or_create_profile() -> core.UserProfile:
 
 def ask_once(engine: core.Engine, profile: core.UserProfile, question: str) -> None:
     """Answer a single inline question (e.g. ``ask how do permissions work``)."""
+    question, images, notes = extract_images(question)
+    _report_image_notes(notes)
+    if images and not question:
+        question = "Describe the attached image and answer based on it."
     try:
         answer, cancelled = run_with_cancel(
-            lambda: engine.ask([{"role": "user", "content": question}], profile),
+            lambda: engine.ask([core.user_message(question, images)], profile),
             "[cyan]Thinking…[/]",
         )
     except core.TranslationError as exc:
-        console.print(f"[bold red]Couldn't answer:[/] {exc}")
+        console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images)}")
         return
     if cancelled:
         console.print("[dim]Cancelled.[/]")
@@ -458,13 +532,18 @@ def run_chat(engine: core.Engine, profile: core.UserProfile) -> None:
             console.print("[dim]Leaving chat.[/]")
             return
 
-        history.append({"role": "user", "content": question})
+        clean_question, images, notes = extract_images(question)
+        _report_image_notes(notes)
+        if images and not clean_question:
+            clean_question = "Describe the attached image and answer based on it."
+
+        history.append(core.user_message(clean_question, images))
         try:
             answer, cancelled = run_with_cancel(
                 lambda: engine.ask(history, profile), "[cyan]Thinking…[/]"
             )
         except core.TranslationError as exc:
-            console.print(f"[bold red]Couldn't answer:[/] {exc}")
+            console.print(f"[bold red]Couldn't answer:[/] {exc}{_vision_hint(images)}")
             history.pop()
             continue
         if cancelled:
@@ -506,6 +585,7 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row(Text.from_markup("Describe a task in plain English, e.g."))
     right.add_row(Text.from_markup("  [cyan]\"what errors hit the journal this hour?\"[/]"))
     right.add_row(Text.from_markup("  [cyan]\"which processes use the most memory?\"[/]"))
+    right.add_row(Text.from_markup("[dim]Add an image path for context: [/][cyan]why this error? ~/err.png[/]"))
     right.add_row("")
     right.add_row(Text.from_markup(f"[bold {ACCENT}]Commands[/]"))
     right.add_row(Text.from_markup("[cyan]ask[/]       ask a Linux question"))
@@ -547,7 +627,10 @@ def _print_help() -> None:
                 "commands are explained)\n"
                 "[cyan]help[/]      Show this help\n"
                 "[cyan]exit[/]      Quit (Ctrl-D also works)\n\n"
-                "[dim]Tip: a leading slash is optional — [/][cyan]/ask[/][dim] works too.[/]"
+                "[dim]Tip: a leading slash is optional — [/][cyan]/ask[/][dim] works too.[/]\n"
+                "[dim]Tip: attach an image for context by including its path, e.g.[/]\n"
+                '[dim]  [/][cyan]why does this fail? ~/screenshot.png[/][dim] '
+                "(needs a vision-capable model).[/]"
             ),
             title="Help",
             border_style=ACCENT,
@@ -674,13 +757,19 @@ def main() -> None:
                 console.print("\n[dim]Profile unchanged.[/]")
             continue
 
+        # --- Pull out any attached image paths for extra context -------------
+        request, images, image_notes = extract_images(request)
+        _report_image_notes(image_notes)
+        if images and not request:
+            request = "Use the attached image to determine the right command."
+
         # --- Translate --------------------------------------------------------
         try:
             command, cancelled = run_with_cancel(
-                lambda: engine.translate(request), "[cyan]Translating…[/]"
+                lambda: engine.translate(request, images), "[cyan]Translating…[/]"
             )
         except core.TranslationError as exc:
-            console.print(f"[bold red]Translation failed:[/] {exc}")
+            console.print(f"[bold red]Translation failed:[/] {exc}{_vision_hint(images)}")
             continue
         if cancelled:
             console.print("[dim]Cancelled.[/]")

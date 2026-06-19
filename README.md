@@ -63,6 +63,14 @@ Use `ask <question>` for a one-shot answer, or `ask` / `chat` for a multi-turn
 conversation about Linux, the shell, and system administration. This is
 information only; nothing is executed, and answers adapt to your experience level.
 
+**Attach an image for context.**
+Include an image path in your prompt — or just drag the file into the terminal —
+and Sentinel sends it to the model as context: *"why is this failing?
+~/screenshot.png"*. Useful for a screenshot of an error, a dashboard, or output
+from another tool. Works in both translate and `ask`/`chat` modes, with any
+vision-capable model (Claude, GPT, Gemini, and most others); a model that can't
+read images simply says so.
+
 **Built for the terminal.**
 A clean welcome box with live status, syntax-highlighted commands, and clear
 output panels. Press **Esc** to cancel any in-progress task: a slow translation,
@@ -117,14 +125,38 @@ straight to the prompt with no menus and no re-entering keys.
 ## Architecture
 
 ```
-core.py    all logic, no UI (engines, safety filter, profile, settings, execution)
-main.py    the terminal UI (built on rich)
-gui/       experimental web UI over the same core (paused; see gui/README.md)
+core.py      all logic, no UI (engines, safety filter, profile, settings, execution)
+main.py      the terminal UI (built on rich)
+mcp_server/  MCP server — exposes the host to AIs as a connectable skill
+gui/         experimental web UI over the same core (paused; see gui/README.md)
 ```
 
 `core.py` is the single source of truth. A web GUI lives under `gui/` but is a
 paused work in progress while its design is reworked; it is not part of the
 shipped CLI.
+
+---
+
+## Connect an AI to your machine (MCP)
+
+Sentinel also runs as a **[Model Context Protocol](https://modelcontextprotocol.io)
+server**, so an assistant like Claude — or your own agent — can connect to the
+host and query it in plain language:
+
+> *"How's the homelab's CPU and power consumption looking right now?"*
+
+The AI calls Sentinel, Sentinel reads the machine, and reports back. The safety
+guarantee holds even with no human at the keyboard, because of a hard split:
+
+- **Read-only diagnostics** (CPU, memory, disk, power/thermal, top processes,
+  network, listening ports, service status, recent errors) are exposed and
+  answered directly — they only observe state, so there is nothing to approve.
+- **Arbitrary execution is never exposed.** `propose_command` translates English
+  into a command and screens it against the blocklist, but **returns it without
+  running it** — a human still approves and runs it in the CLI.
+
+See [`mcp_server/README.md`](mcp_server/README.md) for setup and the full tool
+list.
 
 ---
 
@@ -135,6 +167,7 @@ A leading slash is optional (`/ask` works too).
 | Command | Description |
 |---|---|
 | *(plain English)* | Translate, review, approve, and run a command |
+| *(… + an image path)* | Attach a screenshot/image as context (vision models) |
 | `ask <q>` / `ask` / `chat` | Ask Linux questions (answers only; nothing runs) |
 | `provider` | Switch AI provider |
 | `model` | Pick a model (curated list, or `r` to refresh the live catalog) |
@@ -163,6 +196,8 @@ A leading slash is optional (`/ask` works too).
 - [x] Shared core (`core.py`) so the CLI (and a future GUI) run one engine.
 - [x] Esc to cancel any in-progress task (LLM call or running command).
 - [x] Remembered provider, model, and key across launches.
+- [x] MCP server so external AIs can query the host (`mcp_server/`).
+- [ ] Multi-host / fleet: report on more than the local machine (homelab + box).
 - [ ] Web GUI (paused under `gui/` while the design is reworked).
 - [ ] Remote execution (SSH) and an allow-list mode beyond V1's local execution.
 
