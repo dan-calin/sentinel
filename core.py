@@ -645,11 +645,13 @@ class HostConfig:
     base_url: str
     read_token: str = ""
     admin_token: str = ""
+    allow_execute: bool = True   # controller-side lever: off = treat as read-only
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict:
         return {
             "name": self.name, "base_url": self.base_url,
             "read_token": self.read_token, "admin_token": self.admin_token,
+            "allow_execute": self.allow_execute,
         }
 
     @classmethod
@@ -658,7 +660,13 @@ class HostConfig:
             name=str(data.get("name", "")), base_url=str(data.get("base_url", "")),
             read_token=str(data.get("read_token", "")),
             admin_token=str(data.get("admin_token", "")),
+            allow_execute=bool(data.get("allow_execute", True)),
         )
+
+    @property
+    def can_execute(self) -> bool:
+        """Whether the controller will run commands here (lever on + token set)."""
+        return self.allow_execute and bool(self.admin_token)
 
 
 def hosts_path() -> Path:
@@ -747,6 +755,18 @@ class RemoteAgent:
             exit_code=int(result.get("exit_code", EXIT_COULD_NOT_RUN)),
             stdout=result.get("stdout", ""), stderr=result.get("stderr", ""),
         )
+
+    def get_monitor(self) -> dict:
+        return self._request("GET", "/monitor", self.host.read_token)
+
+    def set_monitor(self, changes: dict) -> dict:
+        return self._request("POST", "/monitor", self.host.admin_token, changes)
+
+    def run_monitor(self) -> list[dict]:
+        return self._request("POST", "/monitor/run", self.host.admin_token).get("alerts", [])
+
+    def get_alerts(self, limit: int = 100) -> list[dict]:
+        return self._request("GET", f"/alerts?limit={limit}", self.host.read_token).get("alerts", [])
 
 
 # ---------------------------------------------------------------------------

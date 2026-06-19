@@ -35,10 +35,14 @@ firewall the port**, and put TLS (a reverse proxy) in front for anything else.
 
 | Method | Path | Token | Purpose |
 |---|---|---|---|
-| GET | `/health` | none | Liveness + identity (hostname, OS, `exec_enabled`) |
+| GET | `/health` | none | Liveness + identity (hostname, OS, `exec_enabled`, `monitor_enabled`) |
 | GET | `/diagnostics` | read | List available diagnostics |
 | POST | `/diagnostics/{name}` | read | Run one diagnostic (optional `{"params": {…}}`) |
 | POST | `/execute` | admin | Screen a command, then run it |
+| GET | `/monitor` | read | The health-monitor config |
+| POST | `/monitor` | admin | Update it (enable, interval, thresholds) |
+| POST | `/monitor/run` | admin | Run the checks now; returns alerts |
+| GET | `/alerts` | read | Recent recorded alerts |
 
 Diagnostics mirror the read-only MCP tools: `system_overview`, `cpu_usage`,
 `memory_usage`, `disk_usage`, `power_and_thermal`, `top_processes`,
@@ -47,14 +51,23 @@ Diagnostics mirror the read-only MCP tools: `system_overview`, `cpu_usage`,
 ## Run it (on each managed host)
 
 One command — it sets up the venv on first run, generates and remembers the
-tokens, and prints the URL + tokens to register on the controller:
+tokens, and prints the URL + tokens to register on the controller. On the first
+run it also **offers to install itself as an always-on systemd service** (starts
+on boot) and enable periodic health checks — say yes and it's done:
 
 ```bash
 cd ~/Linux_LLM
-./run-agent.sh                 # diagnostics + execute (read + admin tokens)
+./run-agent.sh                 # asks to install as a boot service; else foreground
+./run-agent.sh --service       # non-interactive: install + enable health checks
 ./run-agent.sh --read-only     # diagnostics only (no execute)
 PORT=9000 ./run-agent.sh       # pick a port (also HOST=127.0.0.1)
 ```
+
+Installed as a service, manage it with `systemctl status sentinel-agent` and
+`journalctl -u sentinel-agent -f`. The **health monitor** then runs in the
+background, comparing disk/memory/load/services/error-log readings to thresholds
+and recording alerts the controller reads with `alerts` (or `settings → Fleet
+alerts`). Tune thresholds per host from the controller's `settings` menu.
 
 Or do it by hand:
 

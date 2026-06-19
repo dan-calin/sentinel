@@ -227,6 +227,18 @@ Agents use two tokens: a **read** token (diagnostics — safe to give an AI) and
 **admin** token (`/execute`, disabled unless set). See
 [`agent/README.md`](agent/README.md) for setup and the safety model.
 
+Manage all of it from one place with the **`settings`** menu — switch AI
+provider/model, add or edit hosts, flip a host's execute lever on/off, and
+configure each host's health monitor. When a command will run on a remote host,
+the confirmation prompt says so prominently ("runs on: homelab") so it's always
+clear *where* it acts.
+
+**Always-on health checks.** Each agent can run a background monitor that
+periodically checks disk, memory, load, watched services, and error-log volume
+against thresholds, recording any breach. Ask **`alerts`** (or open `settings →
+Fleet alerts`) for *"any problems on the fleet?"* — the agent does the watching
+even when the CLI is closed. The agent's first-run installer sets this up for you.
+
 ---
 
 ## Commands
@@ -247,6 +259,8 @@ A leading slash is optional (`/ask` works too).
 | `hosts` / `host add` / `host remove <name>` | Manage machines in the fleet |
 | `use <host>` / `on <host\|all> <request>` | Target a host; run a one-off on one or all |
 | `status [host]` / `diag <metric> [host]` | Read-only health snapshot or one metric (cpu, memory, disk, power, …) |
+| `settings` | Interactive menu: AI, instances, execute & health toggles, profile |
+| `alerts` | Recent health alerts from every host |
 | `profile` | Re-take the experience questionnaire |
 | `help` | Show the command reference |
 | `exit` | Quit (Ctrl-D also works) |
@@ -283,6 +297,7 @@ A leading slash is optional (`/ask` works too).
 - [x] Vision fallback so text-only models can still read images.
 - [x] Undo / checkpoints for commands that change the system.
 - [x] Multi-host fleet: per-host agents the CLI controls (`agent/`).
+- [x] Always-on health monitor + alerts, with a `settings` menu to manage it all.
 - [ ] Remote undo/checkpoints and per-host environment grounding.
 - [ ] Streamable-HTTP MCP transport so AIs connect to an agent directly.
 - [ ] Web GUI (paused under `gui/` while the design is reworked).

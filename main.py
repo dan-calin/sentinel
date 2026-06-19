@@ -165,11 +165,12 @@ def _render_result(result: core.CommandResult) -> None:
     console.print(f"[{status_style}]Exit code: {result.exit_code}[/]")
 
 
-def confirm_execution(command: str, explanation: str = "") -> bool:
+def confirm_execution(command: str, explanation: str = "", target: str = core.LOCAL_HOST) -> bool:
     """Display the command (and optional explanation) and require an explicit ``y``.
 
     This is the non-negotiable safety gate: returns ``True`` only when the user
-    types ``y``. Anything else (including a bare Enter) is a refusal.
+    types ``y``. Anything else (including a bare Enter) is a refusal. ``target``
+    is shown prominently so it's always clear *where* the command will run.
     """
     if explanation:
         console.print(
@@ -180,17 +181,21 @@ def confirm_execution(command: str, explanation: str = "") -> bool:
                 title_align="left",
             )
         )
+    local = target == core.LOCAL_HOST
+    where = "this machine (local)" if local else target
+    border = "yellow" if local else "magenta"
     console.print(
         Panel(
             Syntax(command, "bash", theme="ansi_dark", word_wrap=True),
-            title="[bold yellow]Proposed command — review before running[/]",
-            subtitle="[dim]This will run on your local machine[/]",
-            border_style="yellow",
+            title=f"[bold {border}]Proposed command — runs on: {where}[/]",
+            subtitle=f"[dim]This will run on {where}[/]",
+            border_style=border,
             title_align="left",
         )
     )
-    console.print("[bold yellow]⚠  Nothing runs until you approve it.[/]")
-    return Prompt.ask("Execute this command?", choices=["y", "n"], default="n") == "y"
+    extra = "" if local else f" on [bold magenta]{target}[/]"
+    console.print(f"[bold yellow]⚠  Nothing runs until you approve it[/]{extra}.")
+    return Prompt.ask(f"Execute this command on {where}?", choices=["y", "n"], default="n") == "y"
 
 
 def _print_answer(engine: core.Engine, answer: str) -> None:
@@ -1354,10 +1359,12 @@ def execute_on(target: str, command: str):
     if host is None:
         console.print(f"[red]Unknown host:[/] {target}")
         return None, False
-    if not host.admin_token:
+    if not host.can_execute:
+        reason = ("execute is turned off for this host" if host.admin_token
+                  else "no admin token")
         console.print(
-            f"[yellow]{target} is read-only — no admin token.[/] "
-            f"[dim]Add one with[/] [cyan]host add[/][dim].[/]"
+            f"[yellow]{target} is read-only — {reason}.[/] "
+            f"[dim]Change it in[/] [cyan]settings[/][dim].[/]"
         )
         return None, False
     agent = core.RemoteAgent(host)
@@ -1568,11 +1575,8 @@ def handle_request(
                 console.print("[dim]Cancelled.[/]")
                 return
 
-    # Human confirmation gate — the heart of the safety model.
-    where = "" if target == core.LOCAL_HOST else f" on [bold]{target}[/]"
-    if where:
-        console.print(f"[dim]Target:[/]{where}")
-    if not confirm_execution(command, explanation):
+    # Human confirmation gate — the heart of the safety model (shows the target).
+    if not confirm_execution(command, explanation, target):
         console.print("[dim]Skipped — nothing was run.[/]")
         return
 
@@ -1608,6 +1612,240 @@ def handle_request(
                 _print_summary(summary)
         except core.TranslationError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Settings menu (interactive hub) and fleet alerts
+# ---------------------------------------------------------------------------
+
+def _menu(title: str, rows: list[str]) -> str:
+    """Render a titled numbered menu and return the raw choice."""
+    body = "\n".join(rows)
+    console.print(Panel(Text.from_markup(body), title=f"[bold {ACCENT}]{title}[/]",
+                        border_style=ACCENT, title_align="left"))
+    return Prompt.ask("Select", default="").strip().lower()
+
+
+def _ask_int(label: str, current: int) -> int:
+    raw = Prompt.ask(label, default=str(current)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return current
+
+
+def _ask_float(label: str, current: float) -> float:
+    raw = Prompt.ask(label, default=str(current)).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return current
+
+
+def _settings_ai(engine: core.Engine) -> core.Engine:
+    """Submenu: provider / model / vision fallback."""
+    while True:
+        choice = _menu("AI", [
+            f"[cyan]1[/] Provider   [dim]current: {engine.label}[/]",
+            f"[cyan]2[/] Model      [dim]current: {engine.model}[/]",
+            f"[cyan]3[/] Vision fallback   [dim]current: {_bridge_model(engine.spec.key) or '(disabled)'}[/]",
+            "[cyan]b[/] Back",
+        ])
+        try:
+            if choice == "1":
+                engine = build_engine(select_provider())
+                select_model(engine)
+                _remember(engine)
+            elif choice == "2":
+                select_model(engine)
+                _remember(engine)
+            elif choice == "3":
+                select_vision_model(engine)
+            else:
+                return engine
+        except core.TranslationError as exc:
+            console.print(f"[red]{exc}[/]")
+        except (EOFError, KeyboardInterrupt):
+            return engine
+
+
+def _host_monitor_summary(host: core.HostConfig) -> str:
+    """One-line monitor state for a host (best-effort)."""
+    try:
+        mon = core.RemoteAgent(host, timeout=5).get_monitor()
+    except core.RemoteError:
+        return "[dim]offline[/]"
+    if mon.get("enabled"):
+        return f"[green]on[/] every {mon.get('interval_seconds', '?')}s"
+    return "[dim]off[/]"
+
+
+def _settings_instances(engine: core.Engine) -> None:
+    """Submenu: list, add, and manage hosts."""
+    while True:
+        names = list(_hosts)
+        rows = ["[cyan]local[/]   [dim]this machine — execute: yes[/]"]
+        for i, name in enumerate(names, start=1):
+            host = _hosts[name]
+            execute = "[green]on[/]" if host.can_execute else "[yellow]off[/]"
+            rows.append(f"[cyan]{i}[/] {name}   [dim]{host.base_url}[/]   execute: {execute}")
+        rows += ["[cyan]a[/] Add a host", "[cyan]b[/] Back"]
+        choice = _menu("Instances", rows)
+        if choice == "a":
+            try:
+                host_add_interactive()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Cancelled.[/]")
+        elif choice.isdigit() and 1 <= int(choice) <= len(names):
+            _manage_host(names[int(choice) - 1])
+        else:
+            return
+
+
+def _manage_host(name: str) -> None:
+    """Submenu for one host: execute lever, health check, edit, remove."""
+    while True:
+        host = _hosts.get(name)
+        if host is None:
+            return
+        execute = "[green]on[/]" if host.can_execute else "[yellow]off[/]"
+        token_note = "" if host.admin_token else " [dim](no admin token)[/]"
+        choice = _menu(f"Host · {name}", [
+            f"[dim]URL:[/] {host.base_url}",
+            f"[cyan]1[/] Execute (run commands here): {execute}{token_note}",
+            f"[cyan]2[/] Health check: {_host_monitor_summary(host)}",
+            "[cyan]3[/] Edit URL / tokens",
+            "[cyan]4[/] Remove this host",
+            "[cyan]b[/] Back",
+        ])
+        if choice == "1":
+            if not host.admin_token:
+                console.print("[yellow]This host has no admin token — add one with Edit first.[/]")
+            else:
+                host.allow_execute = not host.allow_execute
+                core.save_hosts(_hosts)
+                console.print(f"[green]Execute {'enabled' if host.allow_execute else 'disabled'} for {name}.[/]")
+        elif choice == "2":
+            _settings_health(host)
+        elif choice == "3":
+            try:
+                host_add_interactive()  # same name overwrites; re-enter details
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Cancelled.[/]")
+        elif choice == "4":
+            if Prompt.ask(f"Remove host '{name}'?", choices=["y", "n"], default="n") == "y":
+                host_remove(name)
+                return
+        else:
+            return
+
+
+def _settings_health(host: core.HostConfig) -> None:
+    """Configure a host's always-on health monitor (via its agent)."""
+    if not host.admin_token:
+        console.print("[yellow]Configuring the monitor needs the admin token — add one via Edit.[/]")
+        return
+    agent = core.RemoteAgent(host)
+    while True:
+        try:
+            mon = agent.get_monitor()
+        except core.RemoteError as exc:
+            console.print(f"[red]{host.name}: {exc}[/]")
+            return
+        thresholds = mon.get("thresholds", {})
+        choice = _menu(f"Health check · {host.name}", [
+            f"[cyan]1[/] Monitoring: {'[green]on[/]' if mon.get('enabled') else '[dim]off[/]'}",
+            f"[cyan]2[/] Interval: {mon.get('interval_seconds')}s",
+            f"[cyan]3[/] Disk alert at: {thresholds.get('disk_pct')}%",
+            f"[cyan]4[/] Memory alert at: {thresholds.get('memory_pct')}%",
+            f"[cyan]5[/] Load alert at: {thresholds.get('load_factor')}× cores",
+            f"[cyan]6[/] Error-log alert at: {thresholds.get('error_count')}/interval",
+            f"[cyan]7[/] Watched services: {', '.join(thresholds.get('services') or []) or '(none)'}",
+            "[cyan]8[/] Run a check now",
+            "[cyan]b[/] Back",
+        ])
+        try:
+            if choice == "1":
+                agent.set_monitor({"enabled": not mon.get("enabled")})
+            elif choice == "2":
+                agent.set_monitor({"interval_seconds": _ask_int("Interval (seconds)", mon.get("interval_seconds", 300))})
+            elif choice == "3":
+                agent.set_monitor({"thresholds": {"disk_pct": _ask_int("Disk % to alert at", thresholds.get("disk_pct", 90))}})
+            elif choice == "4":
+                agent.set_monitor({"thresholds": {"memory_pct": _ask_int("Memory % to alert at", thresholds.get("memory_pct", 90))}})
+            elif choice == "5":
+                agent.set_monitor({"thresholds": {"load_factor": _ask_float("Load × cores to alert at", thresholds.get("load_factor", 2.0))}})
+            elif choice == "6":
+                agent.set_monitor({"thresholds": {"error_count": _ask_int("Error-log entries to alert at", thresholds.get("error_count", 50))}})
+            elif choice == "7":
+                raw = Prompt.ask("Services to watch (comma-separated, blank for none)",
+                                 default=",".join(thresholds.get("services") or []))
+                services = [s.strip() for s in raw.split(",") if s.strip()]
+                agent.set_monitor({"thresholds": {"services": services}})
+            elif choice == "8":
+                alerts = agent.run_monitor()
+                console.print(f"[green]Ran checks — {len(alerts)} alert(s).[/]" if alerts
+                              else "[green]Ran checks — all clear.[/]")
+            else:
+                return
+        except core.RemoteError as exc:
+            console.print(f"[red]{host.name}: {exc}[/]")
+
+
+def show_fleet_alerts(limit: int = 20) -> None:
+    """Pull recent health alerts from every remote host and show them."""
+    if not _hosts:
+        console.print("[dim]No remote hosts. Add one in[/] [cyan]settings[/][dim].[/]")
+        return
+    any_shown = False
+    for name, host in _hosts.items():
+        try:
+            alerts = core.RemoteAgent(host, timeout=8).get_alerts(limit)
+        except core.RemoteError as exc:
+            console.print(f"[red]{name}:[/] {exc}")
+            continue
+        if not alerts:
+            console.print(f"[green]✓ {name}: no alerts[/]")
+            continue
+        any_shown = True
+        table = Table(title=f"{name} — recent alerts", title_style=f"bold {ACCENT}", expand=False)
+        table.add_column("When", style="dim", no_wrap=True)
+        table.add_column("Level")
+        table.add_column("Check")
+        table.add_column("Message")
+        for alert in alerts[-limit:]:
+            colour = "red" if alert.get("level") == "critical" else "yellow"
+            table.add_row(alert.get("time", "").replace("T", " "),
+                          f"[{colour}]{alert.get('level')}[/]", alert.get("check", ""),
+                          alert.get("message", ""))
+        console.print(table)
+    if not any_shown:
+        console.print("[dim]Fleet looks healthy.[/]")
+
+
+def settings_menu(engine: core.Engine, profile: core.UserProfile):
+    """Top-level interactive settings hub. Returns the (engine, profile)."""
+    while True:
+        choice = _menu("Settings", [
+            "[cyan]1[/] AI            [dim]provider · model · vision fallback[/]",
+            "[cyan]2[/] Instances     [dim]add / manage hosts, execute & health toggles[/]",
+            "[cyan]3[/] Fleet alerts  [dim]recent health alerts from each host[/]",
+            "[cyan]4[/] Profile       [dim]experience level · explanations[/]",
+            "[cyan]b[/] Back to the prompt",
+        ])
+        try:
+            if choice == "1":
+                engine = _settings_ai(engine)
+            elif choice == "2":
+                _settings_instances(engine)
+            elif choice == "3":
+                show_fleet_alerts()
+            elif choice == "4":
+                profile = run_onboarding()
+            else:
+                return engine, profile
+        except (EOFError, KeyboardInterrupt):
+            return engine, profile
 
 
 # ---------------------------------------------------------------------------
@@ -1648,6 +1886,7 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row(Text.from_markup("[cyan]undo[/]      undo the last change · [cyan]history[/]"))
     right.add_row(Text.from_markup("[cyan]hosts[/]     manage machines · [cyan]on <host> …[/]"))
     right.add_row(Text.from_markup("[cyan]status[/]    health snapshot · [cyan]diag power[/]"))
+    right.add_row(Text.from_markup("[cyan]settings[/]  menu: AI · hosts · health · [cyan]alerts[/]"))
     right.add_row(Text.from_markup("[cyan]profile[/]   tune explanation level"))
     right.add_row(Text.from_markup("[cyan]help[/] · [cyan]exit[/]"))
     right.add_row("")
@@ -1695,6 +1934,9 @@ def _print_help() -> None:
                 "disk|power|…> [host][/] for one metric\n"
                 "[dim]Or just name a host in a question — [/][cyan]\"how is my homelab's "
                 "cpu looking?\"[/][dim] — no [/][cyan]use[/][dim] needed.[/]\n"
+                "[cyan]settings[/]  Interactive menu: AI, instances, execute & health "
+                "toggles, profile\n"
+                "[cyan]alerts[/]    Recent health alerts from every host\n"
                 "[cyan]profile[/]   Re-take the experience questionnaire (sets how "
                 "commands are explained)\n"
                 "[cyan]help[/]      Show this help\n"
@@ -1800,6 +2042,12 @@ def main() -> None:
             break
         if command_word == "help":
             _print_help()
+            continue
+        if command_word == "settings":
+            engine, profile = settings_menu(engine, profile)
+            continue
+        if command_word == "alerts":
+            show_fleet_alerts()
             continue
         if first_word in {"ask", "chat"}:
             parts = request.split(maxsplit=1)
