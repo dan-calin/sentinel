@@ -143,6 +143,14 @@ gui/         experimental web UI over the same core (paused; see gui/README.md)
 paused work in progress while its design is reworked; it is not part of the
 shipped CLI.
 
+The destructive-command blocklist has regression tests in `tests/`:
+
+```bash
+python tests/test_safety.py            # standalone, no dependencies
+# or, with pytest:
+pip install -r requirements-dev.txt && pytest
+```
+
 ---
 
 ## Connect an AI to your machine (MCP)
