@@ -482,7 +482,7 @@ def _read_key():
         return ("end",)
     if byte == 0x1B:  # ESC — maybe a CSI sequence (arrows, home/end, paste)
         if _read_raw_byte(0.05) != 0x5B:  # next must be '['; else lone Esc / Alt-key
-            return ("ignore",)
+            return ("escape",)
         seq = b""
         while True:
             nxt = _read_raw_byte(0.05)
@@ -1618,12 +1618,43 @@ def handle_request(
 # Settings menu (interactive hub) and fleet alerts
 # ---------------------------------------------------------------------------
 
+def _read_menu_key() -> str:
+    """Read one menu selection keypress. Returns "" on Esc/Enter (= back/close).
+
+    Single keypress on a raw TTY (no Enter needed); falls back to a typed line
+    where raw mode isn't available.
+    """
+    if not (_TERMIOS_OK and sys.stdin.isatty()):
+        try:
+            return Prompt.ask("Select [dim](Esc to go back)[/]", default="").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+    console.print("[dim]Select (Esc to go back):[/] ", end="")
+    global _input_buf
+    _input_buf = b""
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            kind, *rest = _read_key()
+            if kind == "char" and rest[0].strip():
+                console.print(rest[0])
+                return rest[0].strip().lower()
+            if kind in ("escape", "interrupt", "eof", "enter"):
+                console.print("")
+                return ""
+            # arrows, backspace, paste, etc. → ignore and keep waiting
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
 def _menu(title: str, rows: list[str]) -> str:
-    """Render a titled numbered menu and return the raw choice."""
+    """Render a titled menu and return the chosen key ("" = back, e.g. Esc)."""
     body = "\n".join(rows)
     console.print(Panel(Text.from_markup(body), title=f"[bold {ACCENT}]{title}[/]",
                         border_style=ACCENT, title_align="left"))
-    return Prompt.ask("Select", default="").strip().lower()
+    return _read_menu_key()
 
 
 def _ask_int(label: str, current: int) -> int:
@@ -1649,7 +1680,7 @@ def _settings_ai(engine: core.Engine) -> core.Engine:
             f"[cyan]1[/] Provider   [dim]current: {engine.label}[/]",
             f"[cyan]2[/] Model      [dim]current: {engine.model}[/]",
             f"[cyan]3[/] Vision fallback   [dim]current: {_bridge_model(engine.spec.key) or '(disabled)'}[/]",
-            "[cyan]b[/] Back",
+            "[cyan]Esc[/]/[cyan]b[/] Back",
         ])
         try:
             if choice == "1":
@@ -1689,7 +1720,7 @@ def _settings_instances(engine: core.Engine) -> None:
             host = _hosts[name]
             execute = "[green]on[/]" if host.can_execute else "[yellow]off[/]"
             rows.append(f"[cyan]{i}[/] {name}   [dim]{host.base_url}[/]   execute: {execute}")
-        rows += ["[cyan]a[/] Add a host", "[cyan]b[/] Back"]
+        rows += ["[cyan]a[/] Add a host", "[cyan]Esc[/]/[cyan]b[/] Back"]
         choice = _menu("Instances", rows)
         if choice == "a":
             try:
@@ -1716,7 +1747,7 @@ def _manage_host(name: str) -> None:
             f"[cyan]2[/] Health check: {_host_monitor_summary(host)}",
             "[cyan]3[/] Edit URL / tokens",
             "[cyan]4[/] Remove this host",
-            "[cyan]b[/] Back",
+            "[cyan]Esc[/]/[cyan]b[/] Back",
         ])
         if choice == "1":
             if not host.admin_token:
@@ -1762,7 +1793,7 @@ def _settings_health(host: core.HostConfig) -> None:
             f"[cyan]6[/] Error-log alert at: {thresholds.get('error_count')}/interval",
             f"[cyan]7[/] Watched services: {', '.join(thresholds.get('services') or []) or '(none)'}",
             "[cyan]8[/] Run a check now",
-            "[cyan]b[/] Back",
+            "[cyan]Esc[/]/[cyan]b[/] Back",
         ])
         try:
             if choice == "1":
@@ -1831,7 +1862,7 @@ def settings_menu(engine: core.Engine, profile: core.UserProfile):
             "[cyan]2[/] Instances     [dim]add / manage hosts, execute & health toggles[/]",
             "[cyan]3[/] Fleet alerts  [dim]recent health alerts from each host[/]",
             "[cyan]4[/] Profile       [dim]experience level · explanations[/]",
-            "[cyan]b[/] Back to the prompt",
+            "[cyan]Esc[/]/[cyan]b[/] Back to the prompt",
         ])
         try:
             if choice == "1":
