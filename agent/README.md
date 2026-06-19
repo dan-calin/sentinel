@@ -46,11 +46,20 @@ Diagnostics mirror the read-only MCP tools: `system_overview`, `cpu_usage`,
 
 ## Run it (on each managed host)
 
+One command — it sets up the venv on first run, generates and remembers the
+tokens, and prints the URL + tokens to register on the controller:
+
 ```bash
 cd ~/Linux_LLM
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt -r agent/requirements.txt
+./run-agent.sh                 # diagnostics + execute (read + admin tokens)
+./run-agent.sh --read-only     # diagnostics only (no execute)
+PORT=9000 ./run-agent.sh       # pick a port (also HOST=127.0.0.1)
+```
 
+Or do it by hand:
+
+```bash
+./setup.sh --agent             # venv + deps
 export SENTINEL_AGENT_READ_TOKEN="$(openssl rand -hex 16)"
 export SENTINEL_AGENT_ADMIN_TOKEN="$(openssl rand -hex 16)"   # omit for read-only
 uvicorn agent.server:app --host 0.0.0.0 --port 8765

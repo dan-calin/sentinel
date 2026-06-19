@@ -125,18 +125,20 @@ Requires Python 3.10+.
 
 ```bash
 cd ~/Linux_LLM
-python3 -m venv .venv
-source .venv/bin/activate
+./run.sh          # sets up the venv on first run, then launches the CLI
+```
+
+That's it — `run.sh` creates `.venv` and installs dependencies the first time,
+then starts Sentinel. To set up without launching, run `./setup.sh`. By hand:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Add the key(s) for the provider(s) you'll use:
-cp .env.example .env   # then edit .env
-
 python main.py
 ```
 
-On a fresh Ubuntu/WSL box you may first need `sudo apt install -y python3-venv`.
-Use the virtual environment rather than installing globally.
+On a fresh Ubuntu/WSL/Mint box you may first need `sudo apt install -y python3-venv`.
+Add provider keys interactively on first run, or via `.env` (`cp .env.example .env`).
 
 First run walks you through a short questionnaire, then a provider/model picker.
 After that, Sentinel remembers your provider, model, and API key, so launches go
@@ -193,11 +195,12 @@ list.
 
 ## Manage more than one machine (fleet)
 
-Run the [`agent`](agent/README.md) on each machine you want to manage (a VM, a
-homelab box); your main Sentinel CLI becomes the **controller** that drives them
-over the LAN. The LLM, the safety blocklist, and the `y/n` gate stay on the
-controller — only execution is forwarded to the target's agent, which screens
-the command again server-side before running it.
+On each machine you want to manage (a VM, a homelab box), run
+[`./run-agent.sh`](agent/README.md) — it sets up and starts the agent and prints
+the URL + tokens to register. Your main Sentinel CLI becomes the **controller**
+that drives them over the LAN. The LLM, the safety blocklist, and the `y/n` gate
+stay on the controller — only execution is forwarded to the target's agent,
+which screens the command again server-side before running it.
 
 ```
 host add               # register a host: name, agent URL, tokens
