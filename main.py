@@ -1267,6 +1267,11 @@ def do_restore(arg: str) -> None:
 _hosts: dict[str, core.HostConfig] = {}
 _target: str = core.LOCAL_HOST
 
+# Rolling conversation context for the command loop: recent {"role","content"}
+# turns (a request and the command it produced) so follow-ups like "what about
+# the CPU?" or "now restart it" resolve. Bounded in handle_request.
+_history: list[dict] = []
+
 
 def _known_target(name: str) -> bool:
     return name == core.LOCAL_HOST or name in _hosts
@@ -1494,11 +1499,14 @@ def run_diagnostic(engine: core.Engine, profile: core.UserProfile, target: str, 
 
 def handle_request(
     engine: core.Engine, profile: core.UserProfile, request: str, images, target: str,
+    history: "list[dict] | None" = None,
 ) -> None:
     """Translate a request, screen + confirm it, run it on ``target``, summarize.
 
     The full read→translate→approve→execute flow for one request, factored out so
-    the main loop, ``on <host>``, and ``on all`` all share it.
+    the main loop, ``on <host>``, and ``on all`` all share it. When ``history`` is
+    given, prior turns are passed to the translator (so "what about the CPU?" or
+    "now restart it" resolves) and this turn is appended to it.
     """
     if images and _only_placeholders(request):
         request = "Use the attached image(s) to determine the right command."
@@ -1506,7 +1514,7 @@ def handle_request(
     # Translate (with a vision-bridge fallback for text-only models).
     try:
         command, cancelled = run_with_cancel(
-            lambda: engine.translate(request, images), "[cyan]Translating…[/]"
+            lambda: engine.translate(request, images, history), "[cyan]Translating…[/]"
         )
     except core.TranslationError as exc:
         augmented = _bridge_request(engine, request, images, str(exc))
@@ -1516,7 +1524,7 @@ def handle_request(
         try:
             request = augmented
             command, cancelled = run_with_cancel(
-                lambda: engine.translate(augmented), "[cyan]Translating…[/]"
+                lambda: engine.translate(augmented, None, history), "[cyan]Translating…[/]"
             )
         except core.TranslationError as exc2:
             console.print(f"[bold red]Translation failed:[/] {exc2}")
@@ -1530,6 +1538,12 @@ def handle_request(
             "[dim]Try e.g. [/][cyan]\"how much disk is free?\"[/][dim].[/]"
         )
         return
+
+    # Remember this turn so follow-ups can refer back to it (bounded window).
+    if history is not None:
+        history.append({"role": "user", "content": request})
+        history.append({"role": "assistant", "content": command})
+        del history[:-8]  # keep the last 4 turns
 
     # Safety filter (defense in depth, before any prompt).
     verdict = core.screen_command(command)
@@ -1869,6 +1883,7 @@ def main() -> None:
             name = parts[1].strip() if len(parts) > 1 else ""
             if _known_target(name):
                 _target = name
+                _history.clear()  # switching target starts a fresh conversation
                 console.print(f"[green]Target set to[/] [bold]{name}[/].")
             else:
                 console.print(f"[yellow]Unknown host '{name}'.[/] [dim]See[/] [cyan]hosts[/][dim].[/]")
@@ -1904,19 +1919,19 @@ def main() -> None:
                 handle_request(engine, profile, sub_request, images, destination)
             continue
 
-        # Natural-language targeting: a host named in the request wins over the
-        # active target, and a read-only metric question goes straight to the
-        # reliable diagnostic (no `use`, no `diag` needed).
+        # Natural-language targeting: naming a host switches the active target
+        # (and it sticks, so "what about the CPU?" stays on that host), and a
+        # read-only metric question goes straight to the diagnostic.
         detected = _detect_host(request)
-        active = detected or _target
+        if detected and detected != _target:
+            _target = detected
+            _history.clear()  # new host context — drop the old conversation
         intent = _diagnostic_intent(request) if not images else None
         if intent:
-            run_diagnostic(engine, profile, active, intent)
+            run_diagnostic(engine, profile, _target, intent)
             continue
-        if detected:
-            handle_request(engine, profile, _strip_host_ref(request, detected), images, detected)
-        else:
-            handle_request(engine, profile, request, images, _target)
+        request = _strip_host_ref(request, detected) if detected else request
+        handle_request(engine, profile, request, images, _target, history=_history)
 
 
 if __name__ == "__main__":

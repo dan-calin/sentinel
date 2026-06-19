@@ -215,9 +215,13 @@ it, routing read-only questions straight to the matching diagnostic:
 
 ```
 how is my homelab's cpu usage looking?     # → cpu diagnostic on homelab
-what's the vm disk usage?                   # → disk diagnostic on the vm
+what about the CPU?                          # follow-up — stays on homelab
 restart nginx on homelab                    # → translated + run on homelab
 ```
+
+Naming a host also makes it the active target, and the prompt remembers recent
+turns, so follow-ups like *"what about the CPU?"* or *"now restart it"* resolve
+against the conversation instead of needing a full new sentence.
 
 Agents use two tokens: a **read** token (diagnostics — safe to give an AI) and an
 **admin** token (`/execute`, disabled unless set). See

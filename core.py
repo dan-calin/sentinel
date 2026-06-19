@@ -1445,14 +1445,18 @@ class Engine(abc.ABC):
         """
 
     def translate(
-        self, request: str, images: "list[ImageAttachment] | None" = None
+        self, request: str, images: "list[ImageAttachment] | None" = None,
+        history: "list[dict] | None" = None,
     ) -> str:
         """Translate a natural-language request into one bash command.
 
         Optional ``images`` (e.g. a screenshot of an error) are passed to the
-        model as extra context; the output rules are unchanged.
+        model as extra context; the output rules are unchanged. Optional
+        ``history`` is prior ``{"role", "content"}`` turns (earlier requests and
+        the commands produced) so a follow-up like "what about the CPU?" or "now
+        restart it" resolves against the conversation.
         """
-        messages = [user_message(request, images)]
+        messages = [*(history or []), user_message(request, images)]
         system = SYSTEM_PROMPT + environment_context()
         if images:
             system += (
