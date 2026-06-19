@@ -20,14 +20,18 @@ from __future__ import annotations
 
 import abc
 import base64
+import datetime
 import json
 import os
 import platform
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -71,6 +75,30 @@ SYSTEM_PROMPT = (
 
 # Sentinel value the model is instructed to emit when it cannot translate.
 UNSUPPORTED_SENTINEL = "UNSUPPORTED"
+
+# Prompt for generating an inverse ("undo") command — the fallback when a change
+# wasn't snapshotted (services, packages, links, dirs). It SHOULD reverse clearly
+# symmetrical state changes (e.g. stopping a daemon) and refuse the rest.
+INVERT_SYSTEM = (
+    "You are given a Linux command that was already executed. Output exactly ONE "
+    "command that reverses its effect — an undo. Preserve a leading 'sudo' if the "
+    "original had one.\n"
+    "Reverse these (give the inverse command):\n"
+    "- Filesystem: 'mkdir foo' -> 'rmdir foo'; 'mv a b' -> 'mv b a'; "
+    "'ln -s t l' -> 'rm l'.\n"
+    "- Services/daemons: 'systemctl stop X' -> 'systemctl start X' (and start->"
+    "stop); 'systemctl disable X' -> 'systemctl enable X' (and enable->disable); "
+    "'systemctl mask X' -> 'systemctl unmask X'; likewise 'service X stop' -> "
+    "'service X start'.\n"
+    "- Packages (best effort): 'apt install X' -> 'apt remove X'; "
+    "'apt remove X' -> 'apt install X' (same for apt-get/dnf/yum).\n"
+    "STRICT OUTPUT RULES: output ONLY the raw command — no markdown, no backticks, "
+    "no prose, a single line.\n"
+    "If it cannot be reliably undone — it deleted or overwrote data with no backup, "
+    "made a network request, killed a process you can't know how to restart, or is "
+    "read-only with nothing to undo — output exactly: UNSUPPORTED"
+)
+INVERT_MAX_TOKENS = 200
 
 # Token budgets — each task gets only what it needs, bounding latency and cost.
 MAX_TOKENS = 300            # one shell command
@@ -837,6 +865,422 @@ def _sanitize_command(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Command journal, checkpoints, and undo
+#
+# A layered undo: before a command that changes files, snapshot the paths it
+# will touch so we can restore them exactly; for anything we can't snapshot, an
+# engine generates a best-effort inverse command that still goes through the
+# normal safety gate. Every executed command is recorded in a journal so the
+# user can review history and undo the last change.
+#
+# This is a convenience and an audit trail, NOT disaster recovery: not every
+# command is reversible (you can't un-restart a service or un-send a request),
+# and snapshots are size-capped. The confirmation gate remains the real control.
+# ---------------------------------------------------------------------------
+
+# Commands whose first word means "this changes the filesystem". Used to decide
+# whether to snapshot before running and to flag the entry as mutating.
+_MUTATING_TOKENS = frozenset({
+    "rm", "mv", "cp", "dd", "touch", "mkdir", "rmdir", "tee", "install", "ln",
+    "truncate", "chmod", "chown", "chgrp", "shred", "mkfifo", "unlink", "rsync",
+})
+
+# Wrappers to skip when finding the real command word in a segment.
+_COMMAND_WRAPPERS = frozenset({"sudo", "env", "nice", "nohup", "time", "doas"})
+
+# State changes with no file to snapshot but which ARE reversible via an inverse
+# command (e.g. a stopped daemon -> start it). Flagged mutating so `undo` sees
+# them; subcommand verbs keep read-only queries (systemctl status) from counting.
+_SERVICE_MUTATING_VERBS = frozenset({
+    "start", "stop", "restart", "reload", "reload-or-restart", "try-restart",
+    "enable", "disable", "mask", "unmask", "kill", "isolate", "set-default",
+})
+_PKG_MANAGERS = frozenset({"apt", "apt-get", "dnf", "yum", "zypper", "snap", "pacman"})
+_PKG_MUTATING_VERBS = frozenset({
+    "install", "remove", "purge", "autoremove", "reinstall",
+    "upgrade", "full-upgrade", "dist-upgrade",
+})
+
+
+def _is_state_change(cmd: str, rest: list[str]) -> bool:
+    """Whether a non-file command changes reversible system state (service/pkg)."""
+    verbs = {tok for tok in rest if not tok.startswith("-")}
+    if cmd == "systemctl":
+        return bool(verbs & _SERVICE_MUTATING_VERBS)
+    if cmd == "service":
+        return bool(set(rest) & _SERVICE_MUTATING_VERBS)
+    if cmd in _PKG_MANAGERS:
+        if cmd == "pacman":  # flag-style: -S install, -R remove, -U upgrade
+            return any(tok.startswith(("-S", "-R", "-U")) for tok in rest)
+        return bool(verbs & _PKG_MUTATING_VERBS)
+    return False
+
+# Don't copy snapshots larger than this (per path) — keeps undo cheap and safe.
+MAX_CHECKPOINT_BYTES = 50 * 1024 * 1024
+
+
+def _new_id() -> str:
+    """A sortable, unique id, e.g. '20260619-160501-a1b2c3'."""
+    return time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _path_size(path: Path) -> int:
+    """Total bytes of a file or directory tree (best-effort)."""
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _looks_like_path(token: str) -> bool:
+    """Heuristic: is this argument a file/dir path we could snapshot?"""
+    if not token or token.startswith("-"):
+        return False
+    if any(c in token for c in "|<>;&$`*?"):  # shell metachars / globs → not a literal path
+        return False
+    try:
+        candidate = Path(os.path.expanduser(token))
+    except (ValueError, OSError):
+        return False
+    # Accept it if it exists, or if its parent does (a soon-to-be-created file).
+    parent = candidate.parent
+    return candidate.exists() or (parent != candidate and parent.exists())
+
+
+def classify_command(command: str) -> tuple[bool, list[str]]:
+    """Return (is_mutating, candidate_target_paths) for a command.
+
+    Heuristic and deliberately conservative: it recognizes redirections, in-place
+    ``sed``, and known file-mutating commands, and extracts path-like arguments.
+    Imperfect parsing is fine — unsnapshotted changes fall back to the inverse
+    command, and undo always asks for confirmation.
+    """
+    mutating = False
+    paths: list[str] = []
+
+    for match in re.finditer(r">>?\s*([^\s;|&>]+)", command):  # redirect targets
+        mutating = True
+        paths.append(match.group(1))
+
+    for segment in re.split(r"\|\||&&|[|;&]", command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        index = 0
+        while index < len(tokens) and (
+            tokens[index] in _COMMAND_WRAPPERS or (index == 0 and "=" in tokens[index])
+        ):
+            index += 1
+        if index >= len(tokens):
+            continue
+        cmd = os.path.basename(tokens[index])
+        rest = tokens[index + 1:]
+        is_sed_inplace = cmd == "sed" and any(
+            t == "--in-place" or t.startswith("--in-place=") or re.match(r"-[a-zA-Z]*i", t)
+            for t in rest
+        )
+        if cmd in _MUTATING_TOKENS or is_sed_inplace:
+            mutating = True
+            paths.extend(tok for tok in rest if _looks_like_path(tok))
+        elif _is_state_change(cmd, rest):
+            mutating = True  # reversible via inverse command; nothing to snapshot
+
+    seen, unique = set(), []
+    for path in paths:
+        absolute = os.path.abspath(os.path.expanduser(path))
+        if absolute not in seen:
+            seen.add(absolute)
+            unique.append(path)
+    return mutating, unique
+
+
+@dataclass
+class CheckpointFile:
+    """One path captured in a checkpoint."""
+
+    original: str
+    backup: str | None        # path to the saved copy, or None if not saved
+    existed_before: bool      # False => the command created it (undo removes it)
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "original": self.original, "backup": self.backup,
+            "existed_before": self.existed_before, "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CheckpointFile":
+        return cls(
+            original=data["original"], backup=data.get("backup"),
+            existed_before=bool(data.get("existed_before", True)),
+            note=data.get("note", ""),
+        )
+
+
+@dataclass
+class Checkpoint:
+    """A pre-command snapshot of the paths a command was about to touch."""
+
+    id: str
+    timestamp: str
+    command: str
+    label: str
+    files: list[CheckpointFile]
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "timestamp": self.timestamp, "command": self.command,
+            "label": self.label, "files": [f.to_dict() for f in self.files],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Checkpoint":
+        return cls(
+            id=data["id"], timestamp=data.get("timestamp", ""),
+            command=data.get("command", ""), label=data.get("label", ""),
+            files=[CheckpointFile.from_dict(f) for f in data.get("files", [])],
+        )
+
+    @property
+    def saved_count(self) -> int:
+        return sum(1 for f in self.files if f.backup)
+
+
+def _checkpoints_dir() -> Path:
+    return _config_dir() / "checkpoints"
+
+
+def create_checkpoint(
+    command: str, target_paths: list[str], label: str = "auto"
+) -> Checkpoint | None:
+    """Snapshot the existing target paths before a command runs.
+
+    Existing files/dirs are copied into the checkpoint directory; paths that
+    don't exist yet are recorded so undo can delete what the command creates.
+    Returns ``None`` when there is nothing to track.
+    """
+    if not target_paths:
+        return None
+    checkpoint_id = _new_id()
+    directory = _checkpoints_dir() / checkpoint_id
+    files: list[CheckpointFile] = []
+
+    for index, raw in enumerate(target_paths):
+        original = Path(os.path.expanduser(raw))
+        existed = original.exists()
+        backup, note = None, ""
+        if existed:
+            try:
+                if _path_size(original) > MAX_CHECKPOINT_BYTES:
+                    note = f"not saved (larger than {MAX_CHECKPOINT_BYTES // (1024 * 1024)} MB)"
+                else:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    dest = directory / f"{index}_{original.name}"
+                    if original.is_dir():
+                        shutil.copytree(original, dest, symlinks=True)
+                    else:
+                        shutil.copy2(original, dest)
+                    backup = str(dest)
+            except OSError as exc:
+                note = f"backup failed: {exc}"
+        files.append(CheckpointFile(
+            original=str(original.absolute()), backup=backup,
+            existed_before=existed, note=note,
+        ))
+
+    checkpoint = Checkpoint(
+        id=checkpoint_id, timestamp=_now_iso(), command=command, label=label, files=files,
+    )
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "meta.json").write_text(json.dumps(checkpoint.to_dict(), indent=2))
+    except OSError:
+        pass
+    return checkpoint
+
+
+def load_checkpoint(checkpoint_id: str) -> Checkpoint | None:
+    """Load a checkpoint by id, or ``None`` if absent/unreadable."""
+    try:
+        data = json.loads((_checkpoints_dir() / checkpoint_id / "meta.json").read_text())
+        return Checkpoint.from_dict(data)
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def list_checkpoints() -> list[Checkpoint]:
+    """All saved checkpoints, newest first."""
+    directory = _checkpoints_dir()
+    if not directory.is_dir():
+        return []
+    found = []
+    for child in directory.iterdir():
+        if child.is_dir():
+            checkpoint = load_checkpoint(child.name)
+            if checkpoint:
+                found.append(checkpoint)
+    found.sort(key=lambda c: c.id, reverse=True)
+    return found
+
+
+def restore_checkpoint(checkpoint: Checkpoint) -> list[str]:
+    """Restore a checkpoint: bring back saved files, remove created ones.
+
+    Returns a human-readable log of what it did.
+    """
+    log: list[str] = []
+    for entry in checkpoint.files:
+        original = Path(entry.original)
+        if entry.existed_before:
+            if entry.backup and Path(entry.backup).exists():
+                source = Path(entry.backup)
+                try:
+                    if source.is_dir():
+                        if original.exists():
+                            shutil.rmtree(original, ignore_errors=True)
+                        shutil.copytree(source, original, symlinks=True)
+                    else:
+                        original.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, original)
+                    log.append(f"restored {original}")
+                except OSError as exc:
+                    log.append(f"could not restore {original}: {exc}")
+            else:
+                log.append(f"no saved copy of {original} ({entry.note or 'not saved'})")
+        else:  # the command created it — undo by removing it
+            if original.exists():
+                try:
+                    if original.is_dir():
+                        shutil.rmtree(original)
+                    else:
+                        original.unlink()
+                    log.append(f"removed {original} (created by the command)")
+                except OSError as exc:
+                    log.append(f"could not remove {original}: {exc}")
+            else:
+                log.append(f"{original} was already gone")
+    return log
+
+
+@dataclass
+class JournalEntry:
+    """One executed command, recorded for history and undo."""
+
+    id: str
+    timestamp: str
+    request: str
+    command: str
+    cwd: str
+    exit_code: int
+    mutating: bool
+    checkpoint_id: str | None = None
+    undone: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "timestamp": self.timestamp, "request": self.request,
+            "command": self.command, "cwd": self.cwd, "exit_code": self.exit_code,
+            "mutating": self.mutating, "checkpoint_id": self.checkpoint_id,
+            "undone": self.undone,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "JournalEntry":
+        return cls(
+            id=data["id"], timestamp=data.get("timestamp", ""),
+            request=data.get("request", ""), command=data.get("command", ""),
+            cwd=data.get("cwd", ""), exit_code=int(data.get("exit_code", 0)),
+            mutating=bool(data.get("mutating", False)),
+            checkpoint_id=data.get("checkpoint_id"), undone=bool(data.get("undone", False)),
+        )
+
+
+def _journal_path() -> Path:
+    return _config_dir() / "history.jsonl"
+
+
+def record_command(
+    request: str, command: str, cwd: str, exit_code: int,
+    mutating: bool, checkpoint_id: str | None,
+) -> JournalEntry | None:
+    """Append an executed command to the journal (best-effort)."""
+    entry = JournalEntry(
+        id=_new_id(), timestamp=_now_iso(), request=request, command=command,
+        cwd=cwd, exit_code=exit_code, mutating=mutating, checkpoint_id=checkpoint_id,
+    )
+    try:
+        path = _journal_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry.to_dict()) + "\n")
+    except OSError:
+        return None
+    return entry
+
+
+def load_journal(limit: int | None = None) -> list[JournalEntry]:
+    """Load journal entries, oldest first. ``limit`` keeps only the most recent."""
+    try:
+        lines = _journal_path().read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    entries = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(JournalEntry.from_dict(json.loads(line)))
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return entries[-limit:] if limit else entries
+
+
+def _rewrite_journal(entries: list[JournalEntry]) -> None:
+    try:
+        with _journal_path().open("w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry.to_dict()) + "\n")
+    except OSError:
+        pass
+
+
+def mark_undone(entry_id: str) -> None:
+    """Flag a journal entry as undone."""
+    entries = load_journal()
+    for entry in entries:
+        if entry.id == entry_id:
+            entry.undone = True
+    _rewrite_journal(entries)
+
+
+def last_undoable() -> JournalEntry | None:
+    """The most recent change-making command that hasn't been undone."""
+    for entry in reversed(load_journal()):
+        if entry.mutating and not entry.undone:
+            return entry
+    return None
+
+
+def find_entry(entry_id: str) -> JournalEntry | None:
+    """Find a journal entry by id (prefix match allowed)."""
+    matches = [e for e in load_journal() if e.id == entry_id or e.id.startswith(entry_id)]
+    return matches[-1] if matches else None
+
+
+# ---------------------------------------------------------------------------
 # Translation engines
 # ---------------------------------------------------------------------------
 
@@ -907,6 +1351,16 @@ class Engine(abc.ABC):
         )
         messages = [user_message(user, images)]
         return self._chat(VISION_DESCRIBE_SYSTEM, messages, DESCRIBE_MAX_TOKENS).strip()
+
+    def invert(self, command: str) -> str:
+        """Produce a best-effort command that undoes ``command``.
+
+        Returns :data:`UNSUPPORTED_SENTINEL` when the command cannot be reliably
+        reversed (deleted data, restarted a service, made a network request).
+        The result is still screened and confirmed before it can run.
+        """
+        messages = [{"role": "user", "content": command}]
+        return _sanitize_command(self._chat(INVERT_SYSTEM, messages, INVERT_MAX_TOKENS))
 
     def explain(self, command: str, profile: UserProfile) -> str:
         """Explain a proposed command at the user's experience level."""

@@ -79,10 +79,24 @@ text-only model effectively gains eyes. The default fallback on OpenRouter is a
 free vision model (`nvidia/nemotron-nano-12b-v2-vl:free`); change or disable it
 anytime with the `vision` command.
 
+**Undo and checkpoints.**
+Sentinel keeps a journal of what it ran (`history`) and can undo the last change
+(`undo`). Undo is layered: before a command that edits files, it snapshots the
+paths it will touch and restores them exactly on undo (including removing files
+the command created); for changes with nothing to snapshot — stopping a daemon,
+disabling a service, installing a package — it asks the model for a safe inverse
+command (`systemctl stop X` → `systemctl start X`) and runs it through the same
+`y/n` gate. You can also snapshot a path yourself with `checkpoint <path>` and
+bring it back with `restore`. It is honest about limits: truly irreversible
+actions (deleted data with no snapshot, network requests) report that they can't
+be undone rather than guessing.
+
 **Built for the terminal.**
 A clean welcome box with live status, syntax-highlighted commands, and clear
-output panels. Press **Esc** to cancel any in-progress task: a slow translation,
-a long-running command (its whole process tree is stopped), or a chat reply.
+output panels. Type a request with an image path (or paste a screenshot) and it
+becomes a tidy `[Image #1]` token inline. Press **Esc** to cancel any
+in-progress task: a slow translation, a long-running command (its whole process
+tree is stopped), or a chat reply.
 
 ---
 
@@ -188,6 +202,9 @@ A leading slash is optional (`/ask` works too).
 | `provider` | Switch AI provider |
 | `model` | Pick a model (curated list, or `r` to refresh the live catalog) |
 | `vision` | Set/disable the fallback model that reads images for text-only models |
+| `history` | Show recently run commands and their undo status |
+| `undo [ID]` | Undo the last change (restore a snapshot, or run a safe inverse) |
+| `checkpoint <path>` | Snapshot a file/dir; `checkpoints` lists them, `restore [ID]` brings one back |
 | `profile` | Re-take the experience questionnaire |
 | `help` | Show the command reference |
 | `exit` | Quit (Ctrl-D also works) |
@@ -206,6 +223,9 @@ A leading slash is optional (`/ask` works too).
   `SENTINEL_VISION_MODEL`.
 - **Your profile** (experience level and explanation preference) is saved to
   `~/.config/sentinel/profile.json`.
+- **History and checkpoints** live under `~/.config/sentinel/` (`history.jsonl`
+  and `checkpoints/`); snapshots are size-capped and are a convenience, not a
+  backup system.
 
 ---
 
@@ -217,7 +237,7 @@ A leading slash is optional (`/ask` works too).
 - [x] MCP server so external AIs can query the host (`mcp_server/`).
 - [x] Attach images (paste, Ctrl-V, or path) with inline `[Image #N]` tokens.
 - [x] Vision fallback so text-only models can still read images.
-- [ ] Undo / checkpoints for commands that change the system.
+- [x] Undo / checkpoints for commands that change the system.
 - [ ] Multi-host / fleet: report on more than the local machine (homelab + box).
 - [ ] Web GUI (paused under `gui/` while the design is reworked).
 - [ ] Remote execution (SSH) and an allow-list mode beyond V1's local execution.

@@ -1028,6 +1028,198 @@ def run_chat(engine: core.Engine, profile: core.UserProfile) -> None:
 
 
 # ---------------------------------------------------------------------------
+# History, checkpoints, and undo
+# ---------------------------------------------------------------------------
+
+def _print_history(limit: int = 15) -> None:
+    """Show recently executed commands and their undo status."""
+    entries = core.load_journal(limit=limit)
+    if not entries:
+        console.print("[dim]No commands recorded yet.[/]")
+        return
+    table = Table(title="Recent commands", title_style=f"bold {ACCENT}", expand=False)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("When", style="dim", no_wrap=True)
+    table.add_column("Exit", justify="right")
+    table.add_column("Command")
+    table.add_column("Undo", style="dim")
+    for entry in entries:
+        exit_style = "green" if entry.exit_code == 0 else "red"
+        if entry.undone:
+            undo = "[dim]undone[/]"
+        elif entry.checkpoint_id:
+            undo = "checkpoint"
+        elif entry.mutating:
+            undo = "revertible"
+        else:
+            undo = "[dim]—[/]"
+        table.add_row(
+            entry.id, entry.timestamp.replace("T", " "),
+            f"[{exit_style}]{entry.exit_code}[/]", entry.command, undo,
+        )
+    console.print(table)
+    console.print("[dim]Undo the last change with [/][cyan]undo[/][dim], or a specific one with [/][cyan]undo <ID>[/][dim].[/]")
+
+
+def _apply_restore(checkpoint: core.Checkpoint) -> None:
+    """Run a checkpoint restore and print its log."""
+    for line in core.restore_checkpoint(checkpoint):
+        console.print(f"  [dim]{line}[/]")
+
+
+def do_undo(engine: core.Engine, arg: str) -> None:
+    """Undo the last change-making command (or a specific one by ID)."""
+    entry = core.find_entry(arg) if arg else core.last_undoable()
+    if entry is None:
+        console.print(
+            f"[yellow]No command found for '{arg}'.[/]" if arg
+            else "[yellow]Nothing to undo.[/]"
+        )
+        return
+    if entry.undone:
+        console.print("[dim]That command was already undone.[/]")
+        return
+
+    console.print(f"[dim]Undoing:[/] [cyan]{entry.command}[/]")
+    checkpoint = core.load_checkpoint(entry.checkpoint_id) if entry.checkpoint_id else None
+
+    # Layer 1: a file snapshot exists — restore it exactly.
+    if checkpoint and checkpoint.files:
+        plan = "\n".join(
+            f"• restore [cyan]{f.original}[/]" if f.existed_before
+            else f"• remove [cyan]{f.original}[/] [dim](it was created)[/]"
+            for f in checkpoint.files
+        )
+        console.print(Panel(Text.from_markup(plan), title="[bold yellow]Undo via checkpoint[/]",
+                            border_style="yellow", title_align="left"))
+        if Prompt.ask("Restore this checkpoint?", choices=["y", "n"], default="n") != "y":
+            console.print("[dim]Undo cancelled.[/]")
+            return
+        _apply_restore(checkpoint)
+        core.mark_undone(entry.id)
+        console.print("[green]Undone.[/]")
+        return
+
+    # Layer 2: no snapshot (a service/package/etc. change) — generate an inverse.
+    if not entry.mutating:
+        console.print("[dim]That command didn't change anything — nothing to undo.[/]")
+        return
+    try:
+        inverse, cancelled = run_with_cancel(
+            lambda: engine.invert(entry.command), "[cyan]Working out how to undo…[/]"
+        )
+    except core.TranslationError as exc:
+        console.print(f"[red]Couldn't work out an undo:[/] {exc}")
+        return
+    if cancelled:
+        console.print("[dim]Cancelled.[/]")
+        return
+    if not inverse or inverse == core.UNSUPPORTED_SENTINEL:
+        console.print(
+            "[yellow]This command can't be undone automatically.[/] "
+            "[dim]You'll need to reverse it manually.[/]"
+        )
+        return
+
+    verdict = core.screen_command(inverse)
+    if not verdict.allowed:
+        console.print(Panel(
+            Text.from_markup(f"[bold]Proposed undo:[/]\n  [red]{inverse}[/]\n\n[bold]Reason:[/] {verdict.reason}"),
+            title="[bold red]Undo blocked by safety filter[/]", border_style="red", title_align="left",
+        ))
+        return
+    if not confirm_execution(inverse, f"Reverses: {entry.command}"):
+        console.print("[dim]Undo cancelled — nothing was run.[/]")
+        return
+
+    cancel_event = threading.Event()
+    result, cancelled = run_with_cancel(
+        lambda: core.run_command(inverse, cancel_event), "[cyan]Undoing…[/]",
+        cancel_event=cancel_event,
+    )
+    _render_result(result)
+    mutating, _paths = core.classify_command(inverse)
+    core.record_command(f"[undo of {entry.id}]", inverse, os.getcwd(), result.exit_code, mutating, None)
+    if not cancelled and result.exit_code == 0:
+        core.mark_undone(entry.id)
+        console.print("[green]Undone.[/]")
+    else:
+        console.print("[yellow]The undo command did not complete cleanly — check the output above.[/]")
+
+
+def do_checkpoint(arg: str) -> None:
+    """Manually snapshot a file or directory so it can be restored later."""
+    path = arg.strip().strip("'\"")
+    if not path:
+        console.print("[yellow]Usage:[/] [cyan]checkpoint <path>[/]")
+        return
+    if not os.path.exists(os.path.expanduser(path)):
+        console.print(f"[yellow]No such path:[/] {path}")
+        return
+    checkpoint = core.create_checkpoint(f"manual checkpoint of {path}", [path], label="manual")
+    if checkpoint and checkpoint.saved_count:
+        console.print(
+            f"[green]Checkpoint {checkpoint.id} saved[/] [dim]({path}). Restore with[/] "
+            f"[cyan]restore {checkpoint.id}[/][dim].[/]"
+        )
+    else:
+        console.print("[yellow]Nothing saved[/] [dim](path missing or larger than the size limit).[/]")
+
+
+def _print_checkpoints(limit: int = 20) -> None:
+    """List saved checkpoints."""
+    checkpoints = core.list_checkpoints()
+    if not checkpoints:
+        console.print("[dim]No checkpoints saved.[/]")
+        return
+    table = Table(title="Checkpoints", title_style=f"bold {ACCENT}", expand=False)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("When", style="dim", no_wrap=True)
+    table.add_column("Kind", style="dim")
+    table.add_column("Saved", justify="right")
+    table.add_column("From")
+    for checkpoint in checkpoints[:limit]:
+        table.add_row(
+            checkpoint.id, checkpoint.timestamp.replace("T", " "), checkpoint.label,
+            f"{checkpoint.saved_count}/{len(checkpoint.files)}", checkpoint.command,
+        )
+    console.print(table)
+    console.print("[dim]Restore one with [/][cyan]restore <ID>[/][dim] (newest if omitted).[/]")
+
+
+def do_restore(arg: str) -> None:
+    """Restore a checkpoint by ID (or the most recent one)."""
+    checkpoints = core.list_checkpoints()
+    if not checkpoints:
+        console.print("[dim]No checkpoints to restore.[/]")
+        return
+    arg = arg.strip()
+    if not arg:
+        checkpoint = checkpoints[0]
+    else:
+        checkpoint = core.load_checkpoint(arg) or next(
+            (c for c in checkpoints if c.id.startswith(arg)), None
+        )
+    if checkpoint is None:
+        console.print(f"[yellow]No checkpoint matching '{arg}'.[/]")
+        return
+    plan = "\n".join(
+        f"• restore [cyan]{f.original}[/]" if f.existed_before
+        else f"• remove [cyan]{f.original}[/] [dim](created after the snapshot)[/]"
+        for f in checkpoint.files
+    )
+    console.print(Panel(
+        Text.from_markup(f"[dim]Checkpoint {checkpoint.id} — from:[/] {checkpoint.command}\n\n{plan}"),
+        title="[bold yellow]Restore checkpoint[/]", border_style="yellow", title_align="left",
+    ))
+    if Prompt.ask("Restore now?", choices=["y", "n"], default="n") != "y":
+        console.print("[dim]Restore cancelled.[/]")
+        return
+    _apply_restore(checkpoint)
+    console.print("[green]Restore complete.[/]")
+
+
+# ---------------------------------------------------------------------------
 # Welcome box & help
 # ---------------------------------------------------------------------------
 
@@ -1062,6 +1254,7 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row(Text.from_markup("[cyan]provider[/]  switch AI provider"))
     right.add_row(Text.from_markup("[cyan]model[/]     pick / refresh model"))
     right.add_row(Text.from_markup("[cyan]vision[/]    image fallback model"))
+    right.add_row(Text.from_markup("[cyan]undo[/]      undo the last change · [cyan]history[/]"))
     right.add_row(Text.from_markup("[cyan]profile[/]   tune explanation level"))
     right.add_row(Text.from_markup("[cyan]help[/] · [cyan]exit[/]"))
     right.add_row("")
@@ -1096,6 +1289,11 @@ def _print_help() -> None:
                 "[cyan]model[/]     Pick a model (curated list, or 'r' to refresh live)\n"
                 "[cyan]vision[/]    Set the fallback model that reads images when "
                 "your main model can't\n"
+                "[cyan]history[/]   Show recently run commands and their undo status\n"
+                "[cyan]undo[/] [dim][ID][/]  Undo the last change (restore a snapshot, or "
+                "run a safe inverse command)\n"
+                "[cyan]checkpoint[/] <path>  Snapshot a file/dir; [cyan]checkpoints[/] "
+                "lists them, [cyan]restore[/] [dim][ID][/] brings one back\n"
                 "[cyan]profile[/]   Re-take the experience questionnaire (sets how "
                 "commands are explained)\n"
                 "[cyan]help[/]      Show this help\n"
@@ -1236,6 +1434,30 @@ def main() -> None:
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Vision fallback unchanged.[/]")
             continue
+        if command_word == "history":
+            _print_history()
+            continue
+        if first_word == "undo":
+            parts = request.split(maxsplit=1)
+            try:
+                do_undo(engine, parts[1].strip() if len(parts) > 1 else "")
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Undo cancelled.[/]")
+            continue
+        if command_word == "checkpoints":
+            _print_checkpoints()
+            continue
+        if first_word == "checkpoint":
+            parts = request.split(maxsplit=1)
+            do_checkpoint(parts[1] if len(parts) > 1 else "")
+            continue
+        if first_word == "restore":
+            parts = request.split(maxsplit=1)
+            try:
+                do_restore(parts[1].strip() if len(parts) > 1 else "")
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Restore cancelled.[/]")
+            continue
 
         # --- Attached images were already parsed by the line editor ----------
         if images and _only_placeholders(request):
@@ -1309,6 +1531,14 @@ def main() -> None:
             console.print("[dim]Skipped — nothing was run.[/]")
             continue
 
+        # Snapshot any files this command will touch, so it can be undone.
+        mutating, targets = core.classify_command(command)
+        checkpoint = core.create_checkpoint(command, targets) if (mutating and targets) else None
+        if checkpoint and checkpoint.saved_count:
+            console.print(
+                f"[dim]Checkpoint {checkpoint.id} saved — undo with[/] [cyan]undo[/][dim].[/]"
+            )
+
         # Execution is cancellable: Esc terminates the running command.
         cancel_event = threading.Event()
         result, cancelled = run_with_cancel(
@@ -1317,6 +1547,10 @@ def main() -> None:
             cancel_event=cancel_event,
         )
         _render_result(result)
+        core.record_command(
+            request, command, os.getcwd(), result.exit_code, mutating,
+            checkpoint.id if checkpoint else None,
+        )
         if cancelled:
             console.print("[yellow]Cancelled — the command was stopped.[/]")
             continue
