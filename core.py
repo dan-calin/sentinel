@@ -943,6 +943,14 @@ class Engine(abc.ABC):
     def list_models(self) -> list[str]:
         """Fetch the provider's live model catalog (sorted)."""
 
+    def list_vision_models(self, free_only: bool = False) -> list[tuple[str, bool]]:
+        """Return ``(model_id, is_free)`` for image-capable models, best-effort.
+
+        Empty when the provider exposes no modality metadata (the caller then
+        falls back to letting the user type a model ID).
+        """
+        return []
+
 
 class AnthropicEngine(Engine):
     """Translation engine backed by the native Anthropic SDK."""
@@ -992,6 +1000,12 @@ class AnthropicEngine(Engine):
             return sorted(m.id for m in self._client.models.list())
         except anthropic.APIError as exc:
             raise TranslationError(str(exc)) from exc
+
+    def list_vision_models(self, free_only: bool = False) -> list[tuple[str, bool]]:
+        # Every current Claude model accepts images; none are free.
+        if free_only:
+            return []
+        return [(model, False) for model in self.spec.models]
 
 
 class OpenAICompatEngine(Engine):
@@ -1046,6 +1060,40 @@ class OpenAICompatEngine(Engine):
             return sorted(m.id for m in self._client.models.list().data)
         except Exception as exc:
             raise TranslationError(str(exc)) from exc
+
+    def list_vision_models(self, free_only: bool = False) -> list[tuple[str, bool]]:
+        """Parse the catalog's per-model modality + pricing (e.g. OpenRouter).
+
+        Providers that don't return an ``architecture`` block (plain OpenAI)
+        yield nothing, so the caller falls back to manual entry.
+        """
+        try:
+            listing = self._client.models.list()
+        except Exception as exc:
+            raise TranslationError(str(exc)) from exc
+
+        out: list[tuple[str, bool]] = []
+        for model in getattr(listing, "data", listing) or []:
+            arch = getattr(model, "architecture", None)
+            modalities = arch.get("input_modalities") if isinstance(arch, dict) else None
+            if not modalities or "image" not in modalities:
+                continue
+            model_id = model.id
+            is_free = model_id.endswith(":free")
+            pricing = getattr(model, "pricing", None)
+            if not is_free and isinstance(pricing, dict):
+                try:
+                    is_free = (
+                        float(pricing.get("prompt") or 1) == 0
+                        and float(pricing.get("completion") or 1) == 0
+                    )
+                except (TypeError, ValueError):
+                    is_free = False
+            if free_only and not is_free:
+                continue
+            out.append((model_id, is_free))
+        out.sort(key=lambda item: (not item[1], item[0]))  # free first, then alphabetical
+        return out
 
 
 # ---------------------------------------------------------------------------

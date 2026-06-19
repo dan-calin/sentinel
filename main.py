@@ -780,10 +780,16 @@ def select_model(engine: core.Engine) -> None:
         return
 
 
+def _set_vision_model(value: str | None, label: str) -> None:
+    """Persist the vision-fallback choice and confirm."""
+    _settings.vision_model = value
+    core.save_settings(_settings)
+    console.print(f"[green]Vision fallback {label}.[/]")
+
+
 def select_vision_model(engine: core.Engine) -> None:
     """Set the vision 'fallback' model used when the main model can't see images."""
     provider_default = core.DEFAULT_VISION_MODELS.get(engine.spec.key)
-    effective = _bridge_model(engine.spec.key)
     console.print(
         Panel(
             Text.from_markup(
@@ -799,24 +805,62 @@ def select_vision_model(engine: core.Engine) -> None:
             title_align="left",
         )
     )
-    console.print(
-        f"[dim]Currently using: [/][cyan]{effective or '(disabled)'}[/]\n"
-        "[dim]Enter a model ID to use as the fallback, [/][cyan]default[/][dim] "
-        "for the provider default, [/][cyan]off[/][dim] to disable, or Enter to keep.[/]"
-    )
-    answer = Prompt.ask("Vision fallback model", default="").strip()
-    if not answer:
+
+    candidates: list[tuple[str, bool]] = []
+    while True:
+        if candidates:
+            table = Table(
+                title=f"{engine.label} — vision-capable models",
+                caption="free first; type an ID for any other",
+                title_style=f"bold {ACCENT}",
+                expand=False,
+            )
+            table.add_column("#", justify="right", style="cyan")
+            table.add_column("Model", style="bold")
+            table.add_column("Cost")
+            for index, (name, is_free) in enumerate(candidates, start=1):
+                cost = "[green]free[/]" if is_free else "[dim]paid[/]"
+                table.add_row(str(index), name, cost)
+            console.print(table)
+
+        console.print(
+            f"[dim]Currently using: [/][cyan]{_bridge_model(engine.spec.key) or '(disabled)'}[/]\n"
+            "[dim]Enter a model ID or number, [/][cyan]l[/][dim] to list vision "
+            "models, [/][cyan]free[/][dim] for free ones only, [/][cyan]default[/]"
+            "[dim], [/][cyan]off[/][dim], or Enter to keep.[/]"
+        )
+        answer = Prompt.ask("Vision fallback model", default="").strip()
+
+        if not answer:
+            return
+        low = answer.lower()
+        if low in {"l", "list", "free"}:
+            try:
+                with console.status("[cyan]Fetching vision-capable models…[/]", spinner="dots"):
+                    candidates = engine.list_vision_models(free_only=(low == "free"))
+                if not candidates:
+                    console.print(
+                        "[yellow]This provider doesn't expose image-capability info — "
+                        "type a model ID directly.[/]"
+                    )
+            except core.TranslationError as exc:
+                console.print(f"[red]Could not fetch models:[/] {exc}")
+            continue
+        if low == "default":
+            _set_vision_model(None, f"using the provider default ({provider_default or 'none'})")
+            return
+        if low in {"off", "none", "disable"}:
+            _set_vision_model(_VISION_OFF, "disabled")
+            return
+        if answer.isdigit() and candidates:
+            idx = int(answer)
+            if 1 <= idx <= len(candidates):
+                _set_vision_model(candidates[idx - 1][0], f"set to {candidates[idx - 1][0]}")
+                return
+            console.print("[yellow]Number out of range.[/]")
+            continue
+        _set_vision_model(answer, f"set to {answer}")
         return
-    if answer.lower() == "default":
-        _settings.vision_model = None
-        console.print(f"[green]Using the provider default[/] ([cyan]{provider_default or 'none'}[/]).")
-    elif answer.lower() in {"off", "none", "disable"}:
-        _settings.vision_model = _VISION_OFF
-        console.print("[green]Vision fallback disabled.[/]")
-    else:
-        _settings.vision_model = answer
-        console.print(f"[green]Vision fallback set to[/] [bold]{answer}[/].")
-    core.save_settings(_settings)
 
 
 # ---------------------------------------------------------------------------
