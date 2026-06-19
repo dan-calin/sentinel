@@ -416,62 +416,99 @@ def _render_markup(markup: str) -> str:
     return cap.get()
 
 
-def _byte_ready(timeout: float) -> bool:
-    """Whether stdin has a byte available within ``timeout`` seconds."""
-    return bool(select.select([sys.stdin], [], [], timeout)[0])
+# Bytes read from the fd but not yet consumed. We read straight from the file
+# descriptor with os.read (not sys.stdin.read) so that select() — which peeks at
+# the fd — and our reads agree. Reading via sys.stdin buffers inside Python,
+# leaving select() blind to bytes already pulled off the fd, which made multi-
+# byte sequences like arrow keys (ESC [ C) leak in as the literal text "[C".
+_input_buf = b""
+
+
+def _read_raw_byte(timeout: float | None = None) -> int | None:
+    """Read one byte from stdin's fd. ``None`` on timeout or EOF.
+
+    ``timeout=None`` blocks; ``timeout=0`` is a non-blocking peek-and-read.
+    """
+    global _input_buf
+    if not _input_buf:
+        if timeout is not None and not select.select([sys.stdin], [], [], timeout)[0]:
+            return None
+        chunk = os.read(sys.stdin.fileno(), 256)
+        if not chunk:
+            return None
+        _input_buf = chunk
+    byte, _input_buf = _input_buf[0], _input_buf[1:]
+    return byte
 
 
 def _read_paste_body() -> str:
     """Read a bracketed-paste payload up to the ``ESC[201~`` terminator."""
-    data = ""
-    while not data.endswith("\x1b[201~"):
-        ch = sys.stdin.read(1)
-        if ch == "":
+    data = b""
+    while not data.endswith(b"\x1b[201~"):
+        byte = _read_raw_byte()
+        if byte is None:
             break
-        data += ch
-    if data.endswith("\x1b[201~"):
+        data += bytes([byte])
+    if data.endswith(b"\x1b[201~"):
         data = data[:-6]
+    text = data.decode("utf-8", errors="replace")
     # A pasted path/command is one logical line; fold newlines to spaces.
-    return data.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
 
 
 def _read_key():
     """Read one logical key press, returning a small ``(kind, …)`` token."""
-    ch = sys.stdin.read(1)
-    if ch == "":
+    byte = _read_raw_byte()
+    if byte is None:
         return ("eof",)
-    if ch == "\x03":
+    if byte == 0x03:
         return ("interrupt",)
-    if ch == "\x04":
+    if byte == 0x04:
         return ("eof",)
-    if ch == "\x16":  # Ctrl-V → attach clipboard image
+    if byte == 0x16:  # Ctrl-V → attach clipboard image
         return ("paste-image",)
-    if ch in ("\r", "\n"):
+    if byte in (0x0D, 0x0A):
         return ("enter",)
-    if ch in ("\x7f", "\x08"):
+    if byte in (0x7F, 0x08):
         return ("backspace",)
-    if ch == "\x01":  # Ctrl-A
+    if byte == 0x01:  # Ctrl-A
         return ("home",)
-    if ch == "\x05":  # Ctrl-E
+    if byte == 0x05:  # Ctrl-E
         return ("end",)
-    if ch == "\x1b":
-        if not _byte_ready(0.05):
-            return ("ignore",)  # bare Esc
-        if sys.stdin.read(1) != "[":
+    if byte == 0x1B:  # ESC — maybe a CSI sequence (arrows, home/end, paste)
+        if _read_raw_byte(0.05) != 0x5B:  # next must be '['; else lone Esc / Alt-key
             return ("ignore",)
-        seq = ""
-        while _byte_ready(0.05):
-            c = sys.stdin.read(1)
-            seq += c
-            if c.isalpha() or c == "~":
+        seq = b""
+        while True:
+            nxt = _read_raw_byte(0.05)
+            if nxt is None:
                 break
+            seq += bytes([nxt])
+            if 0x40 <= nxt <= 0x7E:  # final byte of a CSI sequence
+                break
+        if seq == b"200~":
+            return ("paste", _read_paste_body())
         return {
-            "C": ("right",), "D": ("left",), "H": ("home",), "F": ("end",),
-            "3~": ("delete",), "200~": ("paste", _read_paste_body()),
+            b"C": ("right",), b"D": ("left",), b"A": ("up",), b"B": ("down",),
+            b"H": ("home",), b"F": ("end",), b"1~": ("home",), b"4~": ("end",),
+            b"3~": ("delete",),
         }.get(seq, ("ignore",))
-    if ch < " ":
+    if byte < 0x20:
         return ("ignore",)  # other control characters
-    return ("char", ch)
+    if byte < 0x80:
+        return ("char", chr(byte))
+    # UTF-8 multibyte: read the continuation bytes for this character.
+    length = 2 if byte < 0xE0 else 3 if byte < 0xF0 else 4
+    raw = bytes([byte])
+    for _ in range(length - 1):
+        nxt = _read_raw_byte(0.05)
+        if nxt is None:
+            break
+        raw += bytes([nxt])
+    try:
+        return ("char", raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return ("ignore",)
 
 
 def _grab_clipboard_image() -> "core.ImageAttachment | None":
