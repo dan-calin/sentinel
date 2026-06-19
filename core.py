@@ -165,18 +165,50 @@ class ImageAttachment:
     source: str = ""   # original path, for display only
 
 
+def _windows_to_wsl(path: str) -> str | None:
+    """Map a Windows path (``C:\\Users\\x.png``) to its WSL mount, or ``None``.
+
+    A screenshot dragged/pasted from Windows arrives as a ``C:\\…`` path, but on
+    WSL that drive is mounted under ``/mnt/c``. Returns the translated path so a
+    pasted Windows screenshot actually loads instead of being mistaken for text.
+    """
+    match = re.match(r"^([A-Za-z]):[\\/](.*)$", path)
+    if not match:
+        return None
+    drive, rest = match.group(1).lower(), match.group(2).replace("\\", "/")
+    return f"/mnt/{drive}/{rest}"
+
+
+def _resolve_image_path(path: str) -> Path | None:
+    """Return the first existing file among the path and its WSL translation."""
+    candidates = [os.path.expanduser(path)]
+    translated = _windows_to_wsl(path)
+    if translated:
+        candidates.append(translated)
+    for candidate in candidates:
+        resolved = Path(candidate)
+        if resolved.is_file():
+            return resolved
+    return None
+
+
 def load_image(path: str) -> ImageAttachment:
     """Load an image file into an :class:`ImageAttachment`.
+
+    Accepts both POSIX paths and Windows paths (the latter are mapped to their
+    WSL ``/mnt`` mount), so a screenshot pasted from Windows loads correctly.
 
     Raises:
         ImageError: If the path is missing, the type is unsupported, or the
             file is empty or larger than :data:`MAX_IMAGE_BYTES`.
     """
-    resolved = Path(os.path.expanduser(path))
-    ext = resolved.suffix.lower()
+    ext = Path(path).suffix.lower()
     if ext not in SUPPORTED_IMAGE_TYPES:
         supported = ", ".join(sorted(SUPPORTED_IMAGE_TYPES))
         raise ImageError(f"unsupported image type '{ext or path}' (supported: {supported})")
+    resolved = _resolve_image_path(path)
+    if resolved is None:
+        raise ImageError(f"could not find '{path}'")
     try:
         raw = resolved.read_bytes()
     except OSError as exc:
