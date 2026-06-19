@@ -233,6 +233,7 @@ A leading slash is optional (`/ask` works too).
 | `checkpoint <path>` | Snapshot a file/dir; `checkpoints` lists them, `restore [ID]` brings one back |
 | `hosts` / `host add` / `host remove <name>` | Manage machines in the fleet |
 | `use <host>` / `on <host\|all> <request>` | Target a host; run a one-off on one or all |
+| `status [host]` / `diag <metric> [host]` | Read-only health snapshot or one metric (cpu, memory, disk, power, …) |
 | `profile` | Re-take the experience questionnaire |
 | `help` | Show the command reference |
 | `exit` | Quit (Ctrl-D also works) |

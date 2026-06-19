@@ -1328,6 +1328,92 @@ def execute_on(target: str, command: str):
         return None, False
 
 
+# Short, friendly aliases for the read-only diagnostics the agent exposes.
+_DIAGNOSTIC_ALIASES = {
+    "status": "system_overview", "overview": "system_overview", "health": "system_overview",
+    "cpu": "cpu_usage", "load": "cpu_usage",
+    "mem": "memory_usage", "memory": "memory_usage", "ram": "memory_usage",
+    "disk": "disk_usage", "storage": "disk_usage",
+    "power": "power_and_thermal", "thermal": "power_and_thermal",
+    "temp": "power_and_thermal", "temps": "power_and_thermal",
+    "proc": "top_processes", "procs": "top_processes", "processes": "top_processes", "top": "top_processes",
+    "net": "network_overview", "network": "network_overview",
+    "ports": "listening_ports", "logs": "recent_errors", "errors": "recent_errors",
+}
+_DIAGNOSTIC_FUNCS = frozenset(_DIAGNOSTIC_ALIASES.values())
+
+_local_diag = None
+
+
+def _local_diagnostics():
+    """Lazily import the diagnostics catalog for the local host."""
+    global _local_diag
+    if _local_diag is None:
+        import importlib
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server"))
+        _local_diag = importlib.import_module("diagnostics")
+    return _local_diag
+
+
+def _resolve_diagnostic(name: str) -> str | None:
+    name = name.lower()
+    if name in _DIAGNOSTIC_ALIASES:
+        return _DIAGNOSTIC_ALIASES[name]
+    return name if name in _DIAGNOSTIC_FUNCS else None
+
+
+def run_diagnostic(engine: core.Engine, profile: core.UserProfile, target: str, name: str) -> None:
+    """Run a read-only diagnostic on a target (local or a remote agent) and show it."""
+    canonical = _resolve_diagnostic(name)
+    if canonical is None:
+        console.print(
+            f"[yellow]Unknown diagnostic '{name}'.[/] [dim]Try: status, cpu, memory, "
+            "disk, power, processes, network, ports, logs.[/]"
+        )
+        return
+    where = "" if target == core.LOCAL_HOST else f" on {target}"
+    try:
+        if target == core.LOCAL_HOST:
+            output, cancelled = run_with_cancel(
+                lambda: getattr(_local_diagnostics(), canonical)(),
+                f"[cyan]Reading {canonical}…[/]",
+            )
+        else:
+            host = _hosts.get(target)
+            if host is None:
+                console.print(f"[red]Unknown host:[/] {target}")
+                return
+            output, cancelled = run_with_cancel(
+                lambda: core.RemoteAgent(host).diagnostic(canonical),
+                f"[cyan]Reading {canonical}{where}…[/]",
+            )
+    except core.RemoteError as exc:
+        console.print(f"[red]{target}:[/] {exc}")
+        return
+    if cancelled:
+        console.print("[dim]Cancelled.[/]")
+        return
+
+    console.print(Panel(
+        output or "(no output)",
+        title=f"[bold {ACCENT}]{canonical}{where}[/]", border_style=ACCENT, title_align="left",
+    ))
+    # Plain-English read of the numbers, like a command's post-run summary.
+    if profile.explain and output:
+        try:
+            summary, cancelled = run_with_cancel(
+                lambda: engine.summarize(
+                    f"{name}{where}", f"[diagnostic] {canonical}",
+                    core.CommandResult(0, output), profile,
+                ),
+                "[cyan]Summarizing…[/]",
+            )
+            if summary and not cancelled:
+                _print_summary(summary)
+        except core.TranslationError:
+            pass
+
+
 def handle_request(
     engine: core.Engine, profile: core.UserProfile, request: str, images, target: str,
 ) -> None:
@@ -1469,6 +1555,7 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row(Text.from_markup("[cyan]vision[/]    image fallback model"))
     right.add_row(Text.from_markup("[cyan]undo[/]      undo the last change · [cyan]history[/]"))
     right.add_row(Text.from_markup("[cyan]hosts[/]     manage machines · [cyan]on <host> …[/]"))
+    right.add_row(Text.from_markup("[cyan]status[/]    health snapshot · [cyan]diag power[/]"))
     right.add_row(Text.from_markup("[cyan]profile[/]   tune explanation level"))
     right.add_row(Text.from_markup("[cyan]help[/] · [cyan]exit[/]"))
     right.add_row("")
@@ -1512,6 +1599,8 @@ def _print_help() -> None:
                 "manage them\n"
                 "[cyan]use[/] <host>  Target a host for following commands; "
                 "[cyan]on <host|all> <request>[/] runs one-off\n"
+                "[cyan]status[/] [dim][host][/]  Full health snapshot; [cyan]diag <cpu|memory|"
+                "disk|power|…> [host][/] for one metric\n"
                 "[cyan]profile[/]   Re-take the experience questionnaire (sets how "
                 "commands are explained)\n"
                 "[cyan]help[/]      Show this help\n"
@@ -1703,6 +1792,17 @@ def main() -> None:
                 console.print(f"[green]Target set to[/] [bold]{name}[/].")
             else:
                 console.print(f"[yellow]Unknown host '{name}'.[/] [dim]See[/] [cyan]hosts[/][dim].[/]")
+            continue
+        if first_word in {"status", "diag"}:
+            parts = request.split()
+            if first_word == "status":
+                name = "system_overview"
+                rest = parts[1:]
+            else:
+                name = parts[1] if len(parts) > 1 else "system_overview"
+                rest = parts[2:]
+            dest = rest[0] if rest and _known_target(rest[0]) else _target
+            run_diagnostic(engine, profile, dest, name)
             continue
         if first_word == "on":
             parts = request.split(maxsplit=2)
