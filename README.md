@@ -188,13 +188,14 @@ A leading slash is optional (`/ask` works too).
 
 ## Configuration
 
-- **Remembered automatically.** Your chosen provider, model, and API key are
-  saved to `~/.config/sentinel/config.json` (written `chmod 600`, outside the
-  repo, never committed), so you set them once. Change them anytime with the
-  `provider` / `model` commands.
+- **Remembered automatically.** Your chosen provider, model, API key, and vision
+  fallback are saved to `~/.config/sentinel/config.json` (written `chmod 600`,
+  outside the repo, never committed), so you set them once. Change them anytime
+  with the `provider` / `model` / `vision` commands.
 - **API keys** can also come from `.env` (git-ignored); environment values take
   precedence over the saved ones. A key set via `.env` is never prompted for.
-- **Override per launch** with `SENTINEL_PROVIDER` and `SENTINEL_MODEL`.
+- **Override per launch** with `SENTINEL_PROVIDER`, `SENTINEL_MODEL`, and
+  `SENTINEL_VISION_MODEL`.
 - **Your profile** (experience level and explanation preference) is saved to
   `~/.config/sentinel/profile.json`.
 
@@ -206,6 +207,9 @@ A leading slash is optional (`/ask` works too).
 - [x] Esc to cancel any in-progress task (LLM call or running command).
 - [x] Remembered provider, model, and key across launches.
 - [x] MCP server so external AIs can query the host (`mcp_server/`).
+- [x] Attach images (paste, Ctrl-V, or path) with inline `[Image #N]` tokens.
+- [x] Vision fallback so text-only models can still read images.
+- [ ] Undo / checkpoints for commands that change the system.
 - [ ] Multi-host / fleet: report on more than the local machine (homelab + box).
 - [ ] Web GUI (paused under `gui/` while the design is reworked).
 - [ ] Remote execution (SSH) and an allow-list mode beyond V1's local execution.
