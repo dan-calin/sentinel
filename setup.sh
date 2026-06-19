@@ -10,15 +10,20 @@ cd "$(dirname "$0")"
 
 PYTHON="${PYTHON:-python3}"
 
-if ! "$PYTHON" -c "import venv" >/dev/null 2>&1; then
-  echo "The Python 'venv' module is missing. Install it and re-run, e.g.:" >&2
-  echo "  sudo apt install -y python3-venv" >&2
-  exit 1
-fi
-
-if [ ! -d .venv ]; then
+# Create the venv if missing OR incomplete. A failed attempt (e.g. the
+# python3-venv package isn't installed) can leave a partial .venv with no
+# activate script, so check for activate, not just the directory.
+if [ ! -f .venv/bin/activate ]; then
+  rm -rf .venv
   echo "Creating virtual environment (.venv)…"
-  "$PYTHON" -m venv .venv
+  if ! "$PYTHON" -m venv .venv || [ ! -f .venv/bin/activate ]; then
+    rm -rf .venv
+    echo >&2
+    echo "Could not create the virtual environment." >&2
+    echo "On Debian/Ubuntu/Mint, install the venv package and re-run:" >&2
+    echo "  sudo apt install -y python3-venv" >&2
+    exit 1
+  fi
 fi
 # shellcheck disable=SC1091
 source .venv/bin/activate

@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [ ! -d .venv ]; then
+if [ ! -f .venv/bin/activate ]; then
   ./setup.sh
 fi
 # shellcheck disable=SC1091
