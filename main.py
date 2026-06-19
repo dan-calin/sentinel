@@ -1439,13 +1439,22 @@ def _strip_host_ref(text: str, name: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+# "why is it high / what's eating it" — investigative phrasing about cpu/memory
+# is better answered by the top-processes view than the bare usage number.
+_INVESTIGATE_CUES = ("why", "using", "use the most", "causing", "eating", "hogging",
+                     "consum", "culprit", "responsible", "most", "high", "spik")
+
+
 def _diagnostic_intent(text: str) -> str | None:
     """Map a read-only 'how is <metric> looking?' question to a diagnostic name."""
     low = text.lower()
     if set(re.findall(r"[a-z]+", low)) & _ACTION_CUES:   # an action → not a read
         return None
-    if not any(cue in low for cue in _STATUS_CUES):
+    if not (any(cue in low for cue in _STATUS_CUES) or any(c in low for c in _INVESTIGATE_CUES)):
         return None
+    if (any(c in low for c in _INVESTIGATE_CUES)
+            and re.search(r"\b(cpu|memory|mem|ram|load|process|processes)\b", low)):
+        return "top_processes"
     for keyword, canonical in _DIAGNOSTIC_ALIASES.items():
         if re.search(rf"\b{re.escape(keyword)}\b", low):
             return canonical
@@ -2160,13 +2169,11 @@ def main() -> None:
         if first_word == "use":
             parts = request.split(maxsplit=1)
             name = parts[1].strip() if len(parts) > 1 else ""
-            if _known_target(name):
+            if _known_target(name):  # else fall through (e.g. "use less memory")
                 _target = name
                 _history.clear()  # switching target starts a fresh conversation
                 console.print(f"[green]Target set to[/] [bold]{name}[/].")
-            else:
-                console.print(f"[yellow]Unknown host '{name}'.[/] [dim]See[/] [cyan]hosts[/][dim].[/]")
-            continue
+                continue
         if first_word in {"status", "diag"}:
             parts = request.split()
             if first_word == "status":
@@ -2178,25 +2185,20 @@ def main() -> None:
             dest = rest[0] if rest and _known_target(rest[0]) else _target
             run_diagnostic(engine, profile, dest, name)
             continue
+        # `on <host|all> <request>` — only when it really is that form; otherwise
+        # fall through so a sentence that merely starts with "on" is handled as
+        # natural language (which still detects a host named inside it).
         if first_word == "on":
             parts = request.split(maxsplit=2)
             dest = parts[1] if len(parts) > 1 else ""
             sub_request = parts[2].strip() if len(parts) > 2 else ""
-            if not dest or not sub_request:
-                console.print("[dim]Usage: [/][cyan]on <host|all> <request>[/][dim].[/]")
+            if sub_request and (dest == "all" or _known_target(dest)):
+                destinations = [core.LOCAL_HOST, *_hosts] if dest == "all" else [dest]
+                for destination in destinations:
+                    if len(destinations) > 1:
+                        console.rule(f"[bold {ACCENT}]{destination}[/]")
+                    handle_request(engine, profile, sub_request, images, destination)
                 continue
-            if dest == "all":
-                destinations = [core.LOCAL_HOST, *_hosts]
-            elif _known_target(dest):
-                destinations = [dest]
-            else:
-                console.print(f"[yellow]Unknown host '{dest}'.[/] [dim]See[/] [cyan]hosts[/][dim].[/]")
-                continue
-            for destination in destinations:
-                if len(destinations) > 1:
-                    console.rule(f"[bold {ACCENT}]{destination}[/]")
-                handle_request(engine, profile, sub_request, images, destination)
-            continue
 
         # Natural-language targeting: naming a host switches the active target
         # (and it sticks, so "what about the CPU?" stays on that host), and a
