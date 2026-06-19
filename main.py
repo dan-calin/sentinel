@@ -233,38 +233,51 @@ _IMG_PATH_RE = re.compile(
 def extract_images(text: str):
     """Split a prompt into (clean_text, images, notes).
 
-    ``images`` are successfully loaded :class:`core.ImageAttachment` objects;
-    their paths are removed from ``clean_text``. A token that looks like an
-    image path but can't be loaded is left in the text and reported via
-    ``notes`` (a list of ``("ok"|"err", message)``), so a stray ".png" word is
-    never silently swallowed.
+    ``images`` are successfully loaded :class:`core.ImageAttachment` objects.
+    Each loaded image's path is replaced in ``clean_text`` with a tidy
+    ``[Image #N]`` placeholder (so a pasted, GUID-laden file path becomes a
+    clean reference the model can correlate with the attachment). A token that
+    looks like an image path but can't be loaded is left in the text and
+    reported via ``notes`` (``("ok"|"err", message)``), so a stray ".png" word
+    is never silently swallowed.
     """
     matches = list(_IMG_PATH_RE.finditer(text))
     if not matches:
         return text, [], []
 
-    images, notes, spans = [], [], []
+    images, notes, replacements = [], [], []
     for match in matches:
         path = (match.group(1) or match.group(2) or match.group(3)).replace("\\ ", " ")
         try:
             images.append(core.load_image(path))
-            notes.append(("ok", os.path.basename(path)))
-            spans.append(match.span())
+            label = f"Image #{len(images)}"
+            notes.append(("ok", label))
+            replacements.append((match.span(), f"[{label}]"))
         except core.ImageError as exc:
             notes.append(("err", f"{path}: {exc}"))
 
     clean = text
-    for start, end in sorted(spans, reverse=True):  # back-to-front keeps offsets valid
-        clean = clean[:start] + clean[end:]
+    for (start, end), placeholder in sorted(replacements, reverse=True):  # back-to-front
+        clean = clean[:start] + placeholder + clean[end:]
     clean = re.sub(r"\s{2,}", " ", clean).strip()
     return clean, images, notes
+
+
+# Matches the placeholders inserted by extract_images, for "is there any real
+# instruction left?" checks.
+_PLACEHOLDER_RE = re.compile(r"\[Image #\d+\]")
+
+
+def _only_placeholders(text: str) -> bool:
+    """True if ``text`` is nothing but image placeholders / whitespace."""
+    return not _PLACEHOLDER_RE.sub("", text).strip()
 
 
 def _report_image_notes(notes) -> None:
     """Print a short line per attached (or skipped) image."""
     for kind, message in notes:
         if kind == "ok":
-            console.print(f"[dim]Attached image: {message}[/]")
+            console.print(f"[dim]Attached {message}[/]")
         else:
             console.print(f"[yellow]Skipped image[/] [dim]({message})[/]")
 
@@ -487,8 +500,8 @@ def ask_once(engine: core.Engine, profile: core.UserProfile, question: str) -> N
     """Answer a single inline question (e.g. ``ask how do permissions work``)."""
     question, images, notes = extract_images(question)
     _report_image_notes(notes)
-    if images and not question:
-        question = "Describe the attached image and answer based on it."
+    if images and _only_placeholders(question):
+        question = "Describe the attached image(s) and answer based on them."
     try:
         answer, cancelled = run_with_cancel(
             lambda: engine.ask([core.user_message(question, images)], profile),
@@ -534,8 +547,8 @@ def run_chat(engine: core.Engine, profile: core.UserProfile) -> None:
 
         clean_question, images, notes = extract_images(question)
         _report_image_notes(notes)
-        if images and not clean_question:
-            clean_question = "Describe the attached image and answer based on it."
+        if images and _only_placeholders(clean_question):
+            clean_question = "Describe the attached image(s) and answer based on them."
 
         history.append(core.user_message(clean_question, images))
         try:
@@ -760,8 +773,8 @@ def main() -> None:
         # --- Pull out any attached image paths for extra context -------------
         request, images, image_notes = extract_images(request)
         _report_image_notes(image_notes)
-        if images and not request:
-            request = "Use the attached image to determine the right command."
+        if images and _only_placeholders(request):
+            request = "Use the attached image(s) to determine the right command."
 
         # --- Translate --------------------------------------------------------
         try:
