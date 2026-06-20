@@ -1694,6 +1694,121 @@ def handle_request(
 
 
 # ---------------------------------------------------------------------------
+# Plan / task mode — a goal-driven agentic loop with per-step approval
+# ---------------------------------------------------------------------------
+
+PLAN_MAX_STEPS = 25
+
+
+def run_plan(engine: core.Engine, profile: core.UserProfile, goal: str, target: str) -> None:
+    """Pursue a high-level goal one command at a time, approving each step.
+
+    Shows a plan outline, then loops: the model proposes the next command given
+    what's run so far, Sentinel screens + explains + asks y/n, runs it (snapshot
+    + journal as usual), and feeds the result back — until the model says DONE,
+    asks the user something, or is aborted.
+    """
+    try:
+        outline, cancelled = run_with_cancel(
+            lambda: engine.plan_outline(goal), "[cyan]Planning…[/]"
+        )
+    except core.TranslationError as exc:
+        console.print(f"[bold red]Couldn't plan that:[/] {exc}")
+        return
+    if cancelled:
+        console.print("[dim]Cancelled.[/]")
+        return
+
+    where = "" if target == core.LOCAL_HOST else f" on {target}"
+    console.print(Panel(outline, title=f"[bold {ACCENT}]Plan{where}[/]",
+                        border_style=ACCENT, title_align="left"))
+    console.print(f"[yellow]⚠  Every step still needs your y/n approval{(' (' + target + ')') if where else ''}.[/]")
+    if Prompt.ask("Start this task?", choices=["y", "n"], default="n") != "y":
+        console.print("[dim]Task cancelled.[/]")
+        return
+
+    transcript: list[dict] = []
+    for step in range(1, PLAN_MAX_STEPS + 1):
+        try:
+            raw, cancelled = run_with_cancel(
+                lambda: engine.plan_step(goal, transcript), "[cyan]Working out the next step…[/]"
+            )
+        except core.TranslationError as exc:
+            console.print(f"[bold red]Planning failed:[/] {exc}")
+            return
+        if cancelled:
+            console.print("[dim]Task cancelled.[/]")
+            return
+
+        kind, value = core.parse_plan_step(raw)
+        if kind == "done":
+            console.print("[green]✓ Task complete.[/]")
+            return
+        if kind == "ask":
+            try:
+                answer = Prompt.ask(f"[bold blue]{value}[/]").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Task cancelled.[/]")
+                return
+            transcript.append({"note": f"Asked: {value} → user: {answer or '(blank)'}"})
+            continue
+        command = value
+        if not command:
+            console.print("[green]✓ Task complete.[/]")
+            return
+
+        console.rule(f"[dim]step {step}[/]")
+        verdict = core.screen_command(command)
+        if not verdict.allowed:
+            console.print(Panel(
+                Text.from_markup(f"[bold]Blocked:[/]\n  [red]{command}[/]\n\n[bold]Reason:[/] {verdict.reason}"),
+                title="[bold red]🛑 Refused by safety filter[/]", border_style="red", title_align="left"))
+            if Prompt.ask("Skip this step or abort the task?", choices=["skip", "abort"], default="abort") == "abort":
+                return
+            transcript.append({"note": f"Blocked and skipped: {command}"})
+            continue
+
+        explanation = ""
+        if profile.explain:
+            try:
+                explanation, c2 = run_with_cancel(
+                    lambda: engine.explain(command, profile), "[cyan]Explaining…[/]"
+                )
+                if c2:
+                    explanation = ""
+            except core.TranslationError:
+                explanation = ""
+
+        if not confirm_execution(command, explanation, target):
+            if Prompt.ask("Skip this step or abort the task?", choices=["skip", "abort"], default="skip") == "abort":
+                console.print("[dim]Task aborted.[/]")
+                return
+            transcript.append({"note": f"Skipped by user: {command}"})
+            continue
+
+        mutating, targets = core.classify_command(command)
+        checkpoint = (core.create_checkpoint(command, targets)
+                      if target == core.LOCAL_HOST and mutating and targets else None)
+        if checkpoint and checkpoint.saved_count:
+            console.print(f"[dim]Checkpoint {checkpoint.id} saved — undo with[/] [cyan]undo[/][dim].[/]")
+
+        result, cancelled = execute_on(target, command)
+        if result is None:
+            transcript.append({"command": command, "exit_code": "n/a", "output": "(could not run)"})
+            continue
+        _render_result(result)
+        core.record_command(f"[task] {goal}", command, os.getcwd(), result.exit_code, mutating,
+                            checkpoint.id if checkpoint else None, host=target)
+        combined = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
+        transcript.append({"command": command, "exit_code": result.exit_code, "output": combined})
+        if cancelled:
+            if Prompt.ask("Step cancelled — continue the task?", choices=["y", "n"], default="y") != "y":
+                return
+
+    console.print(f"[yellow]Reached the {PLAN_MAX_STEPS}-step limit — stopping.[/]")
+
+
+# ---------------------------------------------------------------------------
 # Settings menu (interactive hub) and fleet alerts
 # ---------------------------------------------------------------------------
 
@@ -2025,6 +2140,7 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     right.add_row("")
     right.add_row(Text.from_markup(f"[bold {ACCENT}]Commands[/]"))
     right.add_row(Text.from_markup("[cyan]ask[/]       ask a Linux question"))
+    right.add_row(Text.from_markup("[cyan]plan[/]      run a multi-step task"))
     right.add_row(Text.from_markup("[cyan]provider[/]  switch AI provider"))
     right.add_row(Text.from_markup("[cyan]model[/]     pick / refresh model"))
     right.add_row(Text.from_markup("[cyan]vision[/]    image fallback model"))
@@ -2061,6 +2177,8 @@ def _print_help() -> None:
                 "[bold]Type a request[/] in plain English to translate + run a command.\n\n"
                 "[cyan]ask[/] <q>   Ask a Linux question (or just [cyan]ask[/] / "
                 "[cyan]chat[/] for a back-and-forth) — answers only, nothing runs\n"
+                "[cyan]plan[/] <goal>  Carry out a multi-step task (e.g. set up a "
+                "server), approving each step\n"
                 "[cyan]provider[/]  Switch AI provider (Anthropic, OpenAI, Gemini, "
                 "OpenRouter, Ollama, Custom)\n"
                 "[cyan]model[/]     Pick a model (curated list, or 'r' to refresh live)\n"
@@ -2287,6 +2405,19 @@ def main() -> None:
                 _history.clear()  # switching target starts a fresh conversation
                 console.print(f"[green]Target set to[/] [bold]{name}[/].")
                 continue
+        if first_word in {"plan", "task"}:
+            parts = request.split(maxsplit=1)
+            goal = parts[1].strip() if len(parts) > 1 else ""
+            if not goal:
+                console.print("[dim]Usage: [/][cyan]plan <goal>[/][dim], e.g. [/][cyan]plan set up a minecraft server[/][dim].[/]")
+                continue
+            dest = _detect_host(goal)            # "...on homelab" runs the plan there
+            goal = _strip_host_ref(goal, dest) if dest else goal
+            try:
+                run_plan(engine, profile, goal, dest or _target)
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Task cancelled.[/]")
+            continue
         if first_word in {"status", "diag"}:
             parts = request.split()
             if first_word == "status":

@@ -108,7 +108,9 @@ User config lives **outside the repo** at `~/.config/sentinel/`
 Done: single-host translate/approve/run + summary; multi-provider; reasoning;
 images + vision fallback; undo/checkpoints; MCP server; multi-host fleet
 (agent + controller); always-on health monitor + `alerts`; `settings` menu;
-natural-language host targeting + conversational memory; paste-aware editor.
+natural-language host targeting + conversational memory; paste-aware editor;
+plan/task mode (goal-driven agentic loop, per-step approval — `Engine.plan_outline`/
+`plan_step`, `core.parse_plan_step`, `main.run_plan`).
 
 Open (roadmap): remote undo/checkpoints; per-host environment grounding (translate
 currently grounds on the controller's env); streamable-HTTP MCP transport so AIs

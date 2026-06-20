@@ -114,6 +114,53 @@ INVERT_SYSTEM = (
 )
 INVERT_MAX_TOKENS = 200
 
+# Multi-step task / plan mode. The model first sketches a human-readable plan,
+# then drives an agentic loop one command at a time — each still screened and
+# approved by the human. Used by the CLI `plan` / `task` command.
+PLAN_OUTLINE_MAX_TOKENS = 500
+PLAN_STEP_MAX_TOKENS = 300
+PLAN_OUTLINE_SYSTEM = (
+    "You are planning a multi-step task on a Linux system. Given the user's "
+    "goal, produce a short, readable numbered plan of the concrete steps you "
+    "will take — for example: find the latest official release, download it, "
+    "create a directory, configure it, run it (in the background), optionally "
+    "open the firewall port. 3–8 steps, high-level, NO shell commands yet. Note "
+    "where you'll need a choice from the user (version, port, directory). End "
+    "with one line noting that every command will need their approval."
+)
+PLAN_STEP_SYSTEM = (
+    "You are carrying out a multi-step task on a Linux system, ONE command at a "
+    "time. You are given the goal and a log of the commands already run with "
+    "their output. Decide the single next shell command that makes progress.\n"
+    "OUTPUT RULES:\n"
+    "- Output ONLY the raw command — no markdown, no backticks, no prose, one "
+    "line (pipes and && allowed; no newlines).\n"
+    "- Prefer official sources (the vendor's own site/API), and read versions/"
+    "filenames from the previous output instead of guessing.\n"
+    "- Long-running services MUST start in the background so the command returns "
+    "— use 'nohup CMD >log 2>&1 &' or create/enable a systemd unit. Never start "
+    "a foreground server that blocks.\n"
+    "- Prefer non-interactive flags (-y, etc.).\n"
+    "SPECIAL OUTPUTS (use these exactly):\n"
+    "- When the goal is fully accomplished, output exactly: DONE\n"
+    "- When you need a decision or value from the user before continuing, output "
+    "exactly: ASK: <one clear question>\n"
+    "- Never output a destructive command (rm -rf, mkfs, dd, …)."
+)
+
+
+def parse_plan_step(raw: str) -> tuple[str, str]:
+    """Interpret a plan-step model output → ('done'|'ask'|'command', value)."""
+    text = raw.strip()
+    if not text:
+        return ("done", "")
+    first = text.split()[0].strip(".:").upper()
+    if first == "DONE":
+        return ("done", "")
+    if text.upper().startswith("ASK:"):
+        return ("ask", text[4:].strip())
+    return ("command", _sanitize_command(text))
+
 # Token budgets — each task gets only what it needs, bounding latency and cost.
 MAX_TOKENS = 300            # one shell command
 EXPLAIN_MAX_TOKENS = 220    # short "what this does" note
@@ -1546,6 +1593,36 @@ class Engine(abc.ABC):
         )
         messages = [user_message(user, images)]
         return self._chat(VISION_DESCRIBE_SYSTEM, messages, DESCRIBE_MAX_TOKENS).strip()
+
+    def plan_outline(self, goal: str) -> str:
+        """Sketch a short, human-readable plan for a multi-step goal."""
+        messages = [{"role": "user", "content": goal}]
+        system = PLAN_OUTLINE_SYSTEM + environment_context()
+        return self._chat(system, messages, PLAN_OUTLINE_MAX_TOKENS).strip()
+
+    def plan_step(self, goal: str, transcript: list[dict]) -> str:
+        """Decide the next command for a task, given what's run so far.
+
+        ``transcript`` is a list of ``{"command", "exit_code", "output"}`` (and
+        optional ``{"note": ...}``) entries. Returns raw model text; interpret it
+        with :func:`parse_plan_step` (command / DONE / ASK).
+        """
+        lines = [f"Goal: {goal}", "", "Steps so far:"]
+        if not transcript:
+            lines.append("(none yet)")
+        for entry in transcript[-10:]:  # bound tokens to the recent steps
+            if "note" in entry:
+                lines.append(f"- {entry['note']}")
+                continue
+            lines.append(f"$ {entry['command']}  (exit {entry['exit_code']})")
+            out = _truncate(entry.get("output", ""), 400)
+            if out:
+                lines.append(out)
+        lines.append("")
+        lines.append("Output the next command, or DONE, or ASK: <question>.")
+        messages = [{"role": "user", "content": "\n".join(lines)}]
+        system = PLAN_STEP_SYSTEM + environment_context()
+        return self._chat(system, messages, PLAN_STEP_MAX_TOKENS).strip()
 
     def invert(self, command: str) -> str:
         """Produce a best-effort command that undoes ``command``.

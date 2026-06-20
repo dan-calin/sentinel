@@ -21,6 +21,9 @@ can undo what it did, and exposes itself to other AIs as a connectable skill.
   `dd`, fork bombs, …) *and* a mandatory `y/n` gate. Nothing auto-runs.
 - **Bring your own AI** — Anthropic, OpenAI, Gemini, OpenRouter, or fully local
   via Ollama; switch provider or model any time.
+- **Plan whole tasks** — give a goal ("set up a Minecraft server") and Sentinel
+  works it step by step (find the official build, download, configure, run,
+  open the port), proposing and **approving each command** as it goes.
 - **Reasoning on demand** — turn on extended thinking for hard questions; off by
   default for speed.
 - **Attach images** — paste a screenshot (or a path) for context; text-only
@@ -122,6 +125,16 @@ the questionnaire anytime with `profile`.
 Use `ask <question>` for a one-shot answer, or `ask` / `chat` for a multi-turn
 conversation about Linux, the shell, and system administration. This is
 information only; nothing is executed, and answers adapt to your experience level.
+
+**Plan mode — multi-step tasks.**
+`plan <goal>` turns a high-level goal into action. Sentinel sketches a plan, then
+works it one command at a time: it proposes the next step, you review and approve
+it (same `y/n` gate and blocklist), it runs, reads the result, and decides what's
+next — adapting as it goes (discover the latest release → download it → run it in
+the background → open the firewall port). It pauses to **ask** when it needs a
+choice (which version, which port), you can **skip** a step or **abort** anytime,
+and every step is journaled so `undo` works. Add a host (`plan … on homelab`) to
+run the whole task on a remote machine.
 
 **Attach an image for context.**
 Paste a screenshot, press **Ctrl-V** to grab the clipboard image, or include an
@@ -297,6 +310,7 @@ A leading slash is optional (`/ask` works too).
 | *(plain English)* | Translate, review, approve, and run a command |
 | *(… + an image path)* | Attach a screenshot/image as context (vision models) |
 | `ask <q>` / `ask` / `chat` | Ask Linux questions (answers only; nothing runs) |
+| `plan <goal>` / `task <goal>` | Carry out a multi-step task, approving each command (e.g. `plan set up a minecraft server`) |
 | `provider` | Switch AI provider |
 | `model` | Pick a model (curated list, or `r` to refresh the live catalog) |
 | `vision` | Set/disable the fallback model that reads images for text-only models |
