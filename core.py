@@ -132,6 +132,28 @@ VISION_DESCRIBE_SYSTEM = (
 # Max characters of stdout/stderr sent to the model for summarization.
 SUMMARY_OUTPUT_CHAR_LIMIT = 4000
 
+# Reasoning / extended-thinking effort. None = off. Mapped per provider:
+# Anthropic → thinking:{type:adaptive} + output_config:{effort}; OpenAI-compatible
+# → reasoning_effort. A model that rejects these is detected and reasoning is
+# disabled for the session (graceful fallback), so it never breaks a request.
+REASONING_LEVELS: tuple[str, ...] = ("low", "medium", "high")
+
+# When reasoning is on, the model spends tokens thinking before answering, so add
+# headroom to the small per-task budgets. Additive (not a large flat floor) so it
+# stays under tight free-tier credit caps that reject big max_tokens requests.
+REASONING_HEADROOM = 2000
+
+# Substrings in a provider error that indicate the reasoning params aren't supported.
+_REASONING_ERROR_HINTS = (
+    "thinking", "effort", "output_config", "reasoning", "budget_tokens",
+    "adaptive", "max_completion_tokens",
+)
+
+
+def _looks_like_reasoning_error(message: str) -> bool:
+    low = message.lower()
+    return any(hint in low for hint in _REASONING_ERROR_HINTS)
+
 # Seconds before a running command is forcibly terminated.
 COMMAND_TIMEOUT_SECONDS = 60
 
@@ -574,6 +596,8 @@ class Settings:
     base_urls: dict[str, str] = field(default_factory=dict)
     # Optional override for the vision-bridge model (else a per-provider default).
     vision_model: str | None = None
+    # Reasoning effort: None (off) or one of REASONING_LEVELS.
+    reasoning: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -582,16 +606,21 @@ class Settings:
             "api_keys": self.api_keys,
             "base_urls": self.base_urls,
             "vision_model": self.vision_model,
+            "reasoning": self.reasoning,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "Settings":
+        reasoning = data.get("reasoning") or None
+        if reasoning not in (None, *REASONING_LEVELS):
+            reasoning = None
         return cls(
             provider=data.get("provider") or None,
             model=data.get("model") or None,
             api_keys=dict(data.get("api_keys") or {}),
             base_urls=dict(data.get("base_urls") or {}),
             vision_model=data.get("vision_model") or None,
+            reasoning=reasoning,
         )
 
 
@@ -1446,6 +1475,7 @@ class Engine(abc.ABC):
     def __init__(self, spec: ProviderSpec, model: str) -> None:
         self.spec = spec
         self.model = model
+        self.reasoning: str | None = None  # None = off; else a REASONING_LEVELS value
 
     @property
     def label(self) -> str:
@@ -1586,18 +1616,26 @@ class AnthropicEngine(Engine):
         return {"role": message["role"], "content": blocks}
 
     def _chat(self, system: str, messages: list[dict], max_tokens: int) -> str:
+        kwargs: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": [self._to_native(m) for m in messages],
+        }
+        if self.reasoning:
+            # Adaptive thinking + effort (current Claude models reject budget_tokens).
+            # Give the answer headroom since thinking consumes tokens.
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": self.reasoning}
+            kwargs["max_tokens"] = max_tokens + REASONING_HEADROOM
         try:
-            # `thinking` is omitted: the safe default across every Claude model
-            # (some, like Fable, reject `disabled`), and these prompts need no
-            # extended reasoning. Anthropic takes `system` as a top-level arg.
-            message = self._client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[self._to_native(m) for m in messages],
-            )
+            message = self._client.messages.create(**kwargs)
         except anthropic.APIError as exc:
+            if self.reasoning and _looks_like_reasoning_error(str(exc)):
+                self.reasoning = None  # this model can't reason — disable for the session
+                return self._chat(system, messages, max_tokens)
             raise TranslationError(str(exc)) from exc
+        # Only text blocks; any thinking blocks are ignored.
         return "".join(b.text for b in message.content if b.type == "text")
 
     def list_models(self) -> list[str]:
@@ -1647,16 +1685,23 @@ class OpenAICompatEngine(Engine):
         return {"role": message["role"], "content": parts}
 
     def _chat(self, system: str, messages: list[dict], max_tokens: int) -> str:
+        kwargs: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system},
+                *(self._to_native(m) for m in messages),
+            ],
+        }
+        if self.reasoning:
+            kwargs["reasoning_effort"] = self.reasoning
+            kwargs["max_tokens"] = max_tokens + REASONING_HEADROOM
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system},
-                    *(self._to_native(m) for m in messages),
-                ],
-            )
+            response = self._client.chat.completions.create(**kwargs)
         except Exception as exc:  # openai exception hierarchy varies by version
+            if self.reasoning and _looks_like_reasoning_error(str(exc)):
+                self.reasoning = None  # this model can't reason — disable for the session
+                return self._chat(system, messages, max_tokens)
             raise TranslationError(str(exc)) from exc
         return response.choices[0].message.content or ""
 

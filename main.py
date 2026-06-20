@@ -740,10 +740,18 @@ def resolve_credentials(spec: core.ProviderSpec) -> core.Credentials:
     return creds
 
 
+def _reasoning_setting() -> str | None:
+    """The active reasoning effort: env override, saved setting, else off."""
+    value = (os.getenv("SENTINEL_REASONING") or _settings.reasoning or "").strip().lower()
+    return value if value in core.REASONING_LEVELS else None
+
+
 def build_engine(spec: core.ProviderSpec, model: str | None = None) -> core.Engine:
     """Resolve credentials interactively, then construct the engine."""
     creds = resolve_credentials(spec)
-    return core.create_engine(spec, model, creds.api_key, creds.base_url)
+    engine = core.create_engine(spec, model, creds.api_key, creds.base_url)
+    engine.reasoning = _reasoning_setting()  # apply remembered reasoning effort
+    return engine
 
 
 def select_provider() -> core.ProviderSpec:
@@ -903,6 +911,29 @@ def select_vision_model(engine: core.Engine) -> None:
             continue
         _set_vision_model(answer, f"set to {answer}")
         return
+
+
+def select_reasoning(engine: core.Engine) -> None:
+    """Turn extended thinking / reasoning on (low/medium/high) or off."""
+    console.print(
+        Panel(
+            Text.from_markup(
+                "[bold]Reasoning[/] lets capable models think before answering — "
+                "better commands and diagnoses on hard questions, at higher latency "
+                "and cost. Models that don't support it fall back automatically.\n"
+                "[dim]Maps to adaptive thinking + effort on Claude, and "
+                "reasoning effort on GPT/others.[/]"
+            ),
+            title="Reasoning effort", border_style=ACCENT, title_align="left",
+        )
+    )
+    current = engine.reasoning or "off"
+    console.print(f"[dim]Currently:[/] [cyan]{current}[/]")
+    answer = Prompt.ask("Reasoning", choices=["off", *core.REASONING_LEVELS], default=current).strip().lower()
+    engine.reasoning = None if answer == "off" else answer
+    _settings.reasoning = engine.reasoning
+    core.save_settings(_settings)
+    console.print(f"[green]Reasoning set to[/] [bold]{answer}[/].")
 
 
 # ---------------------------------------------------------------------------
@@ -1689,6 +1720,7 @@ def _settings_ai(engine: core.Engine) -> core.Engine:
             f"[cyan]1[/] Provider   [dim]current: {engine.label}[/]",
             f"[cyan]2[/] Model      [dim]current: {engine.model}[/]",
             f"[cyan]3[/] Vision fallback   [dim]current: {_bridge_model(engine.spec.key) or '(disabled)'}[/]",
+            f"[cyan]4[/] Reasoning   [dim]current: {engine.reasoning or 'off'}[/]",
             "[cyan]Esc[/]/[cyan]b[/] Back",
         ])
         try:
@@ -1701,6 +1733,8 @@ def _settings_ai(engine: core.Engine) -> core.Engine:
                 _remember(engine)
             elif choice == "3":
                 select_vision_model(engine)
+            elif choice == "4":
+                select_reasoning(engine)
             else:
                 return engine
         except core.TranslationError as exc:
@@ -1904,7 +1938,8 @@ def _print_banner(engine: core.Engine, profile: core.UserProfile) -> None:
     left.add_row("")
     left.add_row(Text.from_markup(f"[bold]Welcome back, {user}![/]"))
     left.add_row(Text.from_markup(f"[{ACCENT}]{engine.label}[/] [dim]·[/] {engine.model}"))
-    left.add_row(Text.from_markup("[green]●[/] [dim]engine ready[/]"))
+    reasoning_note = f" · reasoning {engine.reasoning}" if engine.reasoning else ""
+    left.add_row(Text.from_markup(f"[green]●[/] [dim]engine ready{reasoning_note}[/]"))
     left.add_row(Text.from_markup(
         f"[dim]profile: {profile.experience} · explanations {explanations}[/]"
     ))
@@ -1961,6 +1996,8 @@ def _print_help() -> None:
                 "[cyan]model[/]     Pick a model (curated list, or 'r' to refresh live)\n"
                 "[cyan]vision[/]    Set the fallback model that reads images when "
                 "your main model can't\n"
+                "[cyan]reasoning[/] Turn extended thinking on (low/medium/high) for "
+                "capable models, or off\n"
                 "[cyan]history[/]   Show recently run commands and their undo status\n"
                 "[cyan]undo[/] [dim][ID][/]  Undo the last change (restore a snapshot, or "
                 "run a safe inverse command)\n"
@@ -2125,6 +2162,12 @@ def main() -> None:
                 select_vision_model(engine)
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Vision fallback unchanged.[/]")
+            continue
+        if command_word == "reasoning":
+            try:
+                select_reasoning(engine)
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Reasoning unchanged.[/]")
             continue
         if command_word == "history":
             _print_history()

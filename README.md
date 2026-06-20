@@ -49,6 +49,13 @@ catalog on demand.
 | Ollama (local) | no API key | whatever you have pulled (`llama3.3`, `qwen3`, …) |
 | Custom | any OpenAI-compatible URL + key | your endpoint |
 
+**Reasoning when you want it.**
+Turn on extended thinking with the `reasoning` command (low / medium / high) so
+capable models reason before answering — sharper commands and diagnoses on hard
+questions, at higher latency and cost. It maps to adaptive thinking + effort on
+Claude and reasoning effort on GPT and others; a model that can't reason falls
+back automatically. Off by default.
+
 **Explanations tuned to you.**
 On first launch Sentinel asks about your Linux experience (beginner,
 intermediate, or expert) and whether you want explanations. Before running, it
@@ -253,6 +260,7 @@ A leading slash is optional (`/ask` works too).
 | `provider` | Switch AI provider |
 | `model` | Pick a model (curated list, or `r` to refresh the live catalog) |
 | `vision` | Set/disable the fallback model that reads images for text-only models |
+| `reasoning` | Turn extended thinking on (low/medium/high) for capable models, or off |
 | `history` | Show recently run commands and their undo status |
 | `undo [ID]` | Undo the last change (restore a snapshot, or run a safe inverse) |
 | `checkpoint <path>` | Snapshot a file/dir; `checkpoints` lists them, `restore [ID]` brings one back |
@@ -272,11 +280,11 @@ A leading slash is optional (`/ask` works too).
 - **Remembered automatically.** Your chosen provider, model, API key, and vision
   fallback are saved to `~/.config/sentinel/config.json` (written `chmod 600`,
   outside the repo, never committed), so you set them once. Change them anytime
-  with the `provider` / `model` / `vision` commands.
+  with the `provider` / `model` / `vision` / `reasoning` commands.
 - **API keys** can also come from `.env` (git-ignored); environment values take
   precedence over the saved ones. A key set via `.env` is never prompted for.
-- **Override per launch** with `SENTINEL_PROVIDER`, `SENTINEL_MODEL`, and
-  `SENTINEL_VISION_MODEL`.
+- **Override per launch** with `SENTINEL_PROVIDER`, `SENTINEL_MODEL`,
+  `SENTINEL_VISION_MODEL`, and `SENTINEL_REASONING` (`low`/`medium`/`high`).
 - **Your profile** (experience level and explanation preference) is saved to
   `~/.config/sentinel/profile.json`.
 - **History and checkpoints** live under `~/.config/sentinel/` (`history.jsonl`
