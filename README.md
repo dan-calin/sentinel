@@ -1,21 +1,74 @@
 # Sentinel
 
-A natural-language Linux server manager. Describe what you want in plain
-English; Sentinel translates it into the right shell command, shows you exactly
-what it will run, and executes it **only after you approve it**. Then it reads
-the output back to you in plain English.
-
-It is built for real server work, the kind that means hunting for the right
-flags: checking capacity, parsing error logs, watching game-server processes.
-Sentinel is more than a thin LLM wrapper around a terminal: it knows the flags,
-**refuses destructive commands**, and **interprets messy output** so you do not
-have to, all tuned to your experience level.
+**Run your Linux machines in plain English — safely.** Describe what you want;
+Sentinel turns it into the exact shell command, shows you precisely what will
+run, executes it **only after you approve**, then reads the result back in plain
+English. It manages a single box or a whole fleet, refuses destructive commands,
+can undo what it did, and exposes itself to other AIs as a connectable skill.
 
 ![Sentinel CLI demo](assets/cli-demo.gif?v=2)
 
-> **Safety first.** Sentinel never runs anything on its own. Every command is
-> screened against a destructive-command blocklist **and** gated behind an
-> explicit `y/n` confirmation before it can touch your machine.
+> **Safety first.** Sentinel never runs anything on its own. Every command —
+> local or remote — is screened against a destructive-command blocklist **and**
+> gated behind an explicit `y/n` confirmation before it can touch a machine.
+
+## What it can do
+
+- **Plain English → the right command** with the flags you'd otherwise look up,
+  then a plain-English read-back of the output (*"the busiest core is kernel
+  interrupt work, not your apps"*).
+- **Two layers of safety** — a destructive-command blocklist (`rm -rf`, `mkfs`,
+  `dd`, fork bombs, …) *and* a mandatory `y/n` gate. Nothing auto-runs.
+- **Bring your own AI** — Anthropic, OpenAI, Gemini, OpenRouter, or fully local
+  via Ollama; switch provider or model any time.
+- **Reasoning on demand** — turn on extended thinking for hard questions; off by
+  default for speed.
+- **Attach images** — paste a screenshot (or a path) for context; text-only
+  models get an automatic vision fallback that reads the image for them.
+- **Undo & checkpoints** — snapshots files before edits and reverses them, turns
+  a daemon stop or package install back, and keeps a history of what it ran.
+- **Manage a fleet** — run a tiny agent on each machine, then target any of them
+  in conversation: *"how's my homelab's CPU usage looking?"*
+- **Always-on health monitoring** — each agent watches disk, memory, load,
+  services, and error logs and records alerts you can ask about any time.
+- **An MCP server** — let Claude (or your own agent) connect to a machine and
+  query it, while the human-approval guarantee still holds.
+- **One settings menu** for providers, hosts, per-host execute, and health checks.
+
+---
+
+## Quick start
+
+Requires Python 3.10+ (on a fresh Debian/Ubuntu/Mint box, first run
+`sudo apt install -y python3-venv`).
+
+```bash
+git clone https://github.com/dan-calin/sentinel.git
+cd sentinel
+./run.sh
+```
+
+`run.sh` creates the virtualenv, installs dependencies, and launches Sentinel.
+First run asks two quick questions (your Linux experience), then a provider +
+model picker — paste your API key once and it's remembered. After that, launches
+go straight to the prompt. Then just type:
+
+```
+how much disk space do I have?
+which processes are using the most memory?
+why does this fail? ~/screenshot.png       # attach an image for context
+```
+
+Prefer to do it by hand? Run `./setup.sh` (environment only), or:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
+
+Provider keys are entered interactively on first run and remembered; they can
+also come from `.env` (`cp .env.example .env`).
 
 ---
 
@@ -126,33 +179,6 @@ type English  ->  model translates  ->  safety filter screens
 
 ---
 
-## Getting started
-
-Requires Python 3.10+.
-
-```bash
-cd ~/Linux_LLM
-./run.sh          # sets up the venv on first run, then launches the CLI
-```
-
-That's it — `run.sh` creates `.venv` and installs dependencies the first time,
-then starts Sentinel. To set up without launching, run `./setup.sh`. By hand:
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python main.py
-```
-
-On a fresh Ubuntu/WSL/Mint box you may first need `sudo apt install -y python3-venv`.
-Add provider keys interactively on first run, or via `.env` (`cp .env.example .env`).
-
-First run walks you through a short questionnaire, then a provider/model picker.
-After that, Sentinel remembers your provider, model, and API key, so launches go
-straight to the prompt with no menus and no re-entering keys.
-
----
-
 ## Architecture
 
 ```
@@ -202,20 +228,34 @@ list.
 
 ## Manage more than one machine (fleet)
 
-On each machine you want to manage (a VM, a homelab box), run
-[`./run-agent.sh`](agent/README.md) — it sets up and starts the agent and prints
-the URL + tokens to register. Your main Sentinel CLI becomes the **controller**
-that drives them over the LAN. The LLM, the safety blocklist, and the `y/n` gate
-stay on the controller — only execution is forwarded to the target's agent,
-which screens the command again server-side before running it.
+Your main Sentinel CLI is the **controller**. Each machine you want to manage
+runs a tiny **agent**. The LLM, the safety blocklist, and the `y/n` gate all stay
+on the controller — only execution is forwarded to the target's agent, which
+screens the command again server-side before running it.
 
-```
-host add               # register a host: name, agent URL, tokens
-hosts                  # list machines + health
-use homelab            # target a host for following requests
-on homelab what's using the most disk?
-on all uptime          # fan out to every host (and local)
-```
+**Add a machine in two steps:**
+
+1. **On the machine to manage** (a VM, a homelab box) — clone the repo and start
+   the agent. It sets up its own venv, generates + remembers tokens, and offers
+   to install itself as an always-on service:
+
+   ```bash
+   git clone https://github.com/dan-calin/sentinel.git && cd sentinel
+   ./run-agent.sh        # prints the agent URL + READ/ADMIN tokens to register
+   ```
+
+2. **On the controller** — register it, then talk to it:
+
+   ```
+   host add               # paste the name, agent URL, and the two tokens
+   hosts                  # list machines + health
+   use homelab            # target it for following requests (optional)
+   on homelab what's using the most disk?
+   on all uptime          # fan out to every host (and local)
+   ```
+
+> Keep agents on a trusted LAN/VPN and firewall the port — the token is the only
+> guard. On the managed box you may need `sudo ufw allow 8765/tcp`.
 
 You don't even need `use` — just name a host in the request and Sentinel targets
 it, routing read-only questions straight to the matching diagnostic:
