@@ -584,15 +584,29 @@ def read_prompt(prompt: str):
         body = body[1:]
     sys.stdout.write(lead)
     prompt_ansi = _render_markup(body) + " "
+    prompt_cells = Text.from_markup(body).cell_len + 1  # visible width (+1 for the space)
 
     buf: list[str] = []
     pos = 0
     images: list = []
+    # Multi-row redraw bookkeeping (linenoise-style): the previous cursor offset
+    # (in cells from the prompt start) and the row count of the previous render.
+    state = {"old_pos": 0, "old_rows": 1}
 
     def redraw() -> None:
-        out = "\r" + prompt_ansi + "".join(buf) + "\x1b[K"
-        if (back := len(buf) - pos) > 0:
-            out += f"\x1b[{back}D"
+        """Repaint the (possibly wrapped) input line and place the cursor.
+
+        Single-line `\\r` + clear-to-EOL can't erase wrapped rows, so a long line
+        gets duplicated on every keystroke. This walks up to the block start,
+        clears every prior row, rewrites, and repositions — handling the
+        exact-column-boundary wrap so the cursor never desyncs.
+        """
+        cols = max(20, shutil.get_terminal_size((80, 24)).columns)
+        out, rows = _compose_redraw(
+            prompt_ansi, prompt_cells, buf, pos, state["old_pos"], state["old_rows"], cols
+        )
+        state["old_pos"] = pos
+        state["old_rows"] = rows
         sys.stdout.write(out)
         sys.stdout.flush()
 
@@ -1682,6 +1696,37 @@ def handle_request(
 # ---------------------------------------------------------------------------
 # Settings menu (interactive hub) and fleet alerts
 # ---------------------------------------------------------------------------
+
+def _compose_redraw(prompt_ansi, prompt_cells, buf, pos, old_pos, old_rows, cols):
+    """Build the ANSI to repaint a (possibly wrapped) input line. Pure/testable.
+
+    Returns ``(ansi_string, rows_used)``. Walks up to the start of the previous
+    render, clears each row, rewrites prompt+buffer, and repositions the cursor —
+    with the exact-column-boundary handling that keeps wrapping deterministic.
+    """
+    buflen = len(buf)
+    rows = max(1, (prompt_cells + buflen + cols - 1) // cols)
+    rpos = (prompt_cells + old_pos + cols) // cols   # previous cursor row (1-based)
+
+    out = ""
+    if old_rows - rpos > 0:                 # down to the last row of the old render
+        out += f"\x1b[{old_rows - rpos}B"
+    for _ in range(old_rows - 1):           # clear each row, bottom-up
+        out += "\r\x1b[0K\x1b[1A"
+    out += "\r\x1b[0K"                       # clear the top row
+    out += prompt_ansi + "".join(buf)        # rewrite prompt + buffer
+
+    if pos == buflen and buflen and (prompt_cells + buflen) % cols == 0:
+        out += "\r\n"                        # make the pending end-of-row wrap explicit
+        rows += 1
+
+    rpos2 = (prompt_cells + pos + cols) // cols    # target cursor row (1-based)
+    if rows - rpos2 > 0:
+        out += f"\x1b[{rows - rpos2}A"             # up to the cursor's row
+    col = (prompt_cells + pos) % cols
+    out += "\r" + (f"\x1b[{col}C" if col else "")  # set the cursor column
+    return out, rows
+
 
 def _read_menu_key() -> str:
     """Read one menu selection keypress. Returns "" on Esc/Enter (= back/close).
