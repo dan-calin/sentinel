@@ -1187,7 +1187,7 @@ def do_undo(engine: core.Engine, arg: str) -> None:
     if cancelled:
         console.print("[dim]Cancelled.[/]")
         return
-    if not inverse or inverse == core.UNSUPPORTED_SENTINEL:
+    if core.is_unsupported(inverse):
         console.print(
             "[yellow]This command can't be undone automatically.[/] "
             "[dim]You'll need to reverse it manually.[/]"
@@ -1454,6 +1454,24 @@ _STATUS_CUES = ("how", "what", "show", "looking", "usage", "status", "health",
                 "check", "doing", "report", "?")
 
 
+# Leading words that signal a question/help request rather than a command to run.
+_QUESTION_WORDS = frozenset({
+    "what", "why", "how", "should", "can", "could", "would", "is", "are", "do",
+    "does", "which", "when", "where", "who", "explain", "help", "troubleshoot",
+    "diagnose", "recommend", "suggest",
+})
+
+
+def _looks_like_question(text: str) -> bool:
+    """Whether a request reads as a question/help ask rather than a command."""
+    low = text.strip().lower()
+    if not low:
+        return False
+    if low.endswith("?"):
+        return True
+    return low.split()[0].strip("'\"") in _QUESTION_WORDS
+
+
 def _detect_host(text: str) -> str | None:
     """Return the first registered host name mentioned in the request, if any."""
     low = text.lower()
@@ -1579,11 +1597,18 @@ def handle_request(
     if cancelled:
         console.print("[dim]Cancelled.[/]")
         return
-    if not command or command == core.UNSUPPORTED_SENTINEL:
-        console.print(
-            "[yellow]That isn't a Linux operation I can run.[/] "
-            "[dim]Try e.g. [/][cyan]\"how much disk is free?\"[/][dim].[/]"
-        )
+    if core.is_unsupported(command):
+        # Not a single command. If it reads as a question, answer it (ask mode)
+        # instead of dead-ending — e.g. "why does SSH keep dropping?".
+        if _looks_like_question(request):
+            console.print("[dim]That's a question, not a command — answering it.[/]")
+            ask_once(engine, profile, request, [])
+        else:
+            console.print(
+                "[yellow]That isn't a Linux operation I can run.[/] "
+                "[dim]Ask about it instead with [/][cyan]ask[/][dim], or try e.g. [/]"
+                "[cyan]\"how much disk is free?\"[/][dim].[/]"
+            )
         return
 
     # Remember this turn so follow-ups can refer back to it (bounded window).

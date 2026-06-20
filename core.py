@@ -76,6 +76,20 @@ SYSTEM_PROMPT = (
 # Sentinel value the model is instructed to emit when it cannot translate.
 UNSUPPORTED_SENTINEL = "UNSUPPORTED"
 
+
+def is_unsupported(command: str) -> bool:
+    """Whether a translated 'command' is really the UNSUPPORTED sentinel.
+
+    Tolerant of the model's near-misses — case, surrounding punctuation, and
+    common misspellings like 'UNSUPORTED' — so a typo isn't run as a literal
+    command. Only matches a short, single-token UNSUP* word, never a real
+    command that happens to contain the substring.
+    """
+    if not command:
+        return True
+    token = re.sub(r"[^a-z]", "", command.lower())
+    return token == "unsupported" or (token.startswith("unsup") and len(token) <= 14)
+
 # Prompt for generating an inverse ("undo") command — the fallback when a change
 # wasn't snapshotted (services, packages, links, dirs). It SHOULD reverse clearly
 # symmetrical state changes (e.g. stopping a daemon) and refuse the rest.

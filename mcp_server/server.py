@@ -168,7 +168,7 @@ def propose_command(request: str) -> str:
     except core.TranslationError as exc:
         return f"Could not translate the request: {exc}"
 
-    if command == core.UNSUPPORTED_SENTINEL or not command:
+    if core.is_unsupported(command):
         return "Sentinel could not turn that into a single shell command (UNSUPPORTED)."
 
     verdict = core.screen_command(command)
